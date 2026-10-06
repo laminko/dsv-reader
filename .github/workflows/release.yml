@@ -1,0 +1,33 @@
+# A tag v* builds DSV Reader.app on a macOS runner and publishes it as a GitHub Release, with
+# the version's notes from CHANGELOG.md. The app is ad-hoc signed, not notarized: Gatekeeper
+# asks before the first open (right-click, Open).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: cargo test --locked
+      - name: Build DSV Reader.app
+        run: ./bundle.sh
+      - name: Zip it and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          zip="DSV-Reader-$v-macos-$(uname -m).zip"
+          ditto -c -k --keepParent "target/release/DSV Reader.app" "$zip"
+          awk -v v="$v" 'index($0, "## " v " ") == 1 {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" "$zip" --title "DSV Reader $v" --notes-file notes.md

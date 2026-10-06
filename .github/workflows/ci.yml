@@ -1,0 +1,31 @@
+# Format, lints, and tests on each push and pull request; then a build check with the oldest
+# Rust that Cargo.toml names. macOS only: the app is a macOS app.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust stable with rustfmt and clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - name: Rust 1.95, the rust-version in Cargo.toml
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          cargo +1.95 check --all-targets --locked

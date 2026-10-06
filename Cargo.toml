@@ -1,0 +1,23 @@
+[package]
+name = "dsv-reader"
+version = "0.9.0"
+edition = "2024"
+# The oldest Rust that builds it (checked: 1.95 builds, 1.94 does not; gpui-pre needs it).
+rust-version = "1.95"
+description = "A native macOS app that opens CSV, TSV, and other delimited files, fast on large files"
+license = "MIT"
+repository = "https://github.com/laminko/dsv-reader"
+readme = "README.md"
+keywords = ["csv", "tsv", "viewer", "macos", "gpui"]
+categories = ["gui", "text-processing"]
+# An app, not a library for crates.io.
+publish = false
+
+[dependencies]
+encoding_rs = "0.8.42"
+gpui-kit = "=0.7.1"
+# No Xcode on this Mac: compile the Metal shaders at launch, not with `xcrun metal`.
+gpui-pre-platform = { version = "=0.3.8", features = ["runtime_shaders"] }
+memchr = "2.8.3"
+memmap2 = "0.9.11"
+rayon = "1.12.0"
