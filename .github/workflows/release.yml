@@ -1,6 +1,6 @@
 # A tag v* builds DSV Reader.app on a macOS runner and publishes it as a GitHub Release, with
 # the version's notes from CHANGELOG.md. The app is ad-hoc signed, not notarized: Gatekeeper
-# asks before the first open (right-click, Open).
+# blocks the first open (Privacy & Security → Open Anyway).
 name: Release
 
 on:

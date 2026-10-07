@@ -4,7 +4,7 @@
 //! The scroll position is in rows (f64): 6.55 M rows × 24 px is past what f32 pixels hold exactly.
 //! The paint records where everything went (`Layout`); the mouse reads it back to hit-test.
 
-use crate::dsv::{Dir, Doc, Dtype, Family, Kind, Order, Reading, Sel, Show, SortKey, arrange, family, show};
+use crate::dsv::{Dir, Doc, Dtype, Family, Kind, Order, Reading, Sel, Show, SortKey, arrange, family, is_zero, show};
 use gpui_kit::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -43,8 +43,14 @@ pub struct Tokens {
     pub accent_hover: Hsla,
     /// Selected cells.
     pub sel: Hsla,
-    /// The column names and the row numbers: one color, a step darker than the toolbar's bar.
+    /// The column names: a step darker than the toolbar's bar.
     pub head: Hsla,
+    /// Every second row of the view, under the cells; `bg` when zebra rows are off.
+    pub zebra: Hsla,
+    /// The row-number column: between `bg` and `head`.
+    pub nums: Hsla,
+    /// The text of a date or a date-and-time cell.
+    pub date: Hsla,
 }
 
 impl Tokens {
@@ -66,27 +72,35 @@ impl Tokens {
             accent_hover: rgb(0x174AA6).into(),
             sel: hsla(0.608, 0.74, 0.47, 0.12),
             head: rgb(0xECEEF1).into(),
+            zebra: rgb(0xF8F9FA).into(),
+            nums: rgb(0xF2F3F5).into(),
+            date: rgb(0x0F6E62).into(),
         }
     }
 
+    /// Soft Dark: low glare, no pure black or white. Ink on every surface is 7.3:1 or more,
+    /// muted 4.5:1 or more.
     pub fn dark() -> Tokens {
         Tokens {
-            bg: rgb(0x16181C).into(),
-            bar: rgb(0x1E2126).into(),
-            ink: rgb(0xE7E9EC).into(),
-            muted: rgb(0x9AA1AB).into(),
-            line: rgb(0x353A42).into(),
-            line_soft: rgb(0x2A2E35).into(),
-            thumb: rgb(0x4A505A).into(),
-            line_strong: rgb(0x4A505A).into(),
-            ring: hsla(0.608, 0.83, 0.65, 0.30),
+            bg: rgb(0x1E2127).into(),
+            bar: rgb(0x23272E).into(),
+            ink: rgb(0xC9CED6).into(),
+            muted: rgb(0x9AA2AD).into(),
+            line: rgb(0x2F343C).into(),
+            line_soft: rgb(0x2A2F37).into(),
+            thumb: rgb(0x3A404A).into(),
+            line_strong: rgb(0x3A404A).into(),
+            ring: rgba(0x5A7FB84D).into(),
             mark: rgb(0x3D3522).into(),
-            field: rgb(0x25282E).into(),
-            hover: rgb(0x2C3038).into(),
-            accent: rgb(0x1F5FD1).into(),
-            accent_hover: rgb(0x3A74DD).into(),
-            sel: hsla(0.608, 0.83, 0.65, 0.22),
-            head: rgb(0x23272D).into(),
+            field: rgb(0x2A2F37).into(),
+            hover: rgb(0x323843).into(),
+            accent: rgb(0x4A6FA5).into(),
+            accent_hover: rgb(0x5679B0).into(),
+            sel: rgba(0x5A7FB838).into(),
+            head: rgb(0x252A31).into(),
+            zebra: rgb(0x22262C).into(),
+            nums: rgb(0x21252B).into(),
+            date: rgb(0x7DBFB0).into(),
         }
     }
 }
@@ -126,8 +140,10 @@ impl Default for ColFmt {
 pub fn fits(s: &Show, t: Dtype) -> bool {
     match s {
         Show::Plain => true,
-        Show::Number { .. } | Show::Percent { .. } | Show::Currency { .. } | Show::Duration { .. } => family(t) == Family::Number,
-        Show::Date(_) | Show::DateTime(..) => t == Dtype::Date,
+        Show::Number { .. } | Show::Percent { .. } | Show::Currency { .. } => family(t) == Family::Number,
+        Show::Duration { .. } => matches!(family(t), Family::Number | Family::Time),
+        Show::Date(_) | Show::DateTime(..) => family(t) == Family::Date,
+        Show::Time(_) => matches!(t, Dtype::Time | Dtype::DateTime),
         Show::YesNo { .. } => t == Dtype::Bool,
     }
 }
@@ -656,7 +672,7 @@ impl Frame {
 
     /// A cell's text, glyph by glyph from the cache: CoreText shapes about 10 µs a cell, so a
     /// page of new rows missed a 165 Hz frame. False when a character needs full shaping.
-    // ponytail: no kerning; grid fonts are mostly monospace. A proportional font sets a little loose.
+    // Limit: no kerning; grid fonts are mostly monospace. A proportional font sets a little loose.
     #[allow(clippy::too_many_arguments)]
     fn quick(&self, window: &mut Window, text: &str, face: (&Font, f32, &Glyphs), color: Hsla, (l, r, y): (f32, f32, f32), right: bool, base: f32) -> bool {
         let mut glyphs = Vec::with_capacity(text.len());
@@ -672,7 +688,9 @@ impl Frame {
         }
         let width: f32 = glyphs.iter().map(|g| g.1.2).sum();
         let room = r - l;
-        let ell = (width > room).then(|| self.glyph(window, '…', face)).flatten();
+        // 0.5 px of slack, as in `text`: the glyphs one by one can add up a hair wider than the
+        // shaped text that sized the box (the row numbers' "0,000,000", a fitted column).
+        let ell = (width > room + 0.5).then(|| self.glyph(window, '…', face)).flatten();
         let (count, shown) = match ell {
             None => (glyphs.len(), width),
             Some(e) => {
@@ -773,7 +791,7 @@ impl Frame {
 
         window.paint_quad(fill(b, t.bg));
         // The row numbers sit on the header color, as the column names do.
-        window.paint_quad(fill(rect(x0, body_top, cells_left, bottom), t.head));
+        window.paint_quad(fill(rect(x0, body_top, cells_left, bottom), t.nums));
         let first = top as usize;
         let dy = ((top - first as f64) * rh as f64) as f32;
         // A row is parsed up to the last column on screen: a wide file costs no more.
@@ -789,6 +807,10 @@ impl Frame {
             let d = self.view.as_ref().map_or(r, |v| v[r] as usize);
             let in_rows = bounds.is_some_and(|(t, _, b, _)| (t..=b).contains(&r));
             window.with_content_mask(Some(ContentMask { bounds: rect(x0, body_top, right, bottom) }), |window| {
+                // By place in the view, so a sort or a filter keeps them even.
+                if r % 2 == 1 && t.zebra != t.bg {
+                    window.paint_quad(fill(rect(cells_left, y, right, y + rh), t.zebra));
+                }
                 if self.mark == Some(d) {
                     window.paint_quad(fill(rect(x0, y, right, y + rh), t.mark));
                 }
@@ -809,14 +831,19 @@ impl Frame {
                 for (k, &c) in shown.iter().enumerate().take(last_k + 1).skip(first_k) {
                     let raw = fields.get(c).map_or("", String::as_str);
                     let dt = doc.dtypes.get(c).copied().unwrap_or(Dtype::String);
-                    let rd = doc.reads.get(c).copied().unwrap_or(Reading { comma: false, order: Order::Ymd });
+                    let rd = doc.reads.get(c).copied().unwrap_or(Reading { comma: false, order: Order::Ymd, short_year: false });
                     let shown_as = show(raw, dt, rd, self.shows.get(c).unwrap_or(&Show::Plain));
                     let value = shown_as.as_deref().unwrap_or(raw);
                     if value.is_empty() {
                         continue;
                     }
-                    let numeric = matches!(dt, Dtype::Int | Dtype::Float);
-                    self.cell(window, cx, value, t.ink, (x_of(k) + PAD, x_of(k + 1) - PAD, y), numeric, base);
+                    let numeric = matches!(dt, Dtype::Int | Dtype::Float | Dtype::Time);
+                    let color = match dt {
+                        Dtype::Date | Dtype::DateTime => t.date,
+                        _ if is_zero(dt, rd, raw) => t.muted,
+                        _ => t.ink,
+                    };
+                    self.cell(window, cx, value, color, (x_of(k) + PAD, x_of(k + 1) - PAD, y), numeric, base);
                 }
             });
             window.with_content_mask(Some(ContentMask { bounds: nums }), |window| {
@@ -905,8 +932,8 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     // Named, not `super::*`: gpui-kit's glob brings a `test` macro that shadows Rust's.
-    use super::{Hit, Layout};
-    use gpui_kit::{point, px};
+    use super::{Hit, Layout, Tokens};
+    use gpui_kit::{Hsla, Rgba, point, px};
 
     fn layout() -> Layout {
         // Header 0..30, rows of 30 from y 30; row numbers 0..50; columns 100 wide from x 50.
@@ -963,5 +990,29 @@ mod tests {
         let mut short = l.clone();
         short.n = 12;
         assert_eq!(short.hit(point(px(60.0), px(100.0))), Hit::None, "below the last row");
+    }
+    #[test]
+    fn soft_dark_text_reads() {
+        // WCAG contrast: 4.5:1 is the AA level for body text.
+        let lum = |c: Hsla| {
+            let c = Rgba::from(c);
+            let f = |x: f32| if x <= 0.03928 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
+            0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+        };
+        let ratio = |a: Hsla, b: Hsla| (lum(a).max(lum(b)) + 0.05) / (lum(a).min(lum(b)) + 0.05);
+        let t = Tokens::dark();
+        for (fg, name) in [(t.ink, "ink"), (t.muted, "muted")] {
+            for bg in [t.bg, t.bar, t.head, t.field, t.hover] {
+                assert!(ratio(fg, bg) >= 4.5, "{name} on {bg:?}: {:.2}", ratio(fg, bg));
+            }
+        }
+        // The cell text on the cell fills, in both themes: dates, zeros (muted), and the rest.
+        for t in [Tokens::light(), Tokens::dark()] {
+            for (fg, name) in [(t.date, "date"), (t.muted, "muted"), (t.ink, "ink")] {
+                for bg in [t.bg, t.zebra, t.nums] {
+                    assert!(ratio(fg, bg) >= 4.5, "{name} on {bg:?}: {:.2}", ratio(fg, bg));
+                }
+            }
+        }
     }
 }

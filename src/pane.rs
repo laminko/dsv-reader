@@ -1,8 +1,9 @@
-//! The side pane (the Record viewer and the Profile) and the filter rows, in the toolbar's
-//! style. The pane sits right of the grid or below it, at the size kept in the settings; with
-//! both panes on, they split it, and the one turned on first stays on top.
+//! The side panes (the Record viewer and the Profile) and the filter rows, in the toolbar's
+//! style. The Profile sits right of the grid; the Viewer sits there too, or below the grid, at
+//! the sizes kept in the settings. Two panes on the right split it, and the one turned on first
+//! stays on top.
 
-use crate::dsv::{Distinct, Doc, Dtype, Family, Filter, Op, Order, Profile, Reading, Values, arity, bin_range, date_label, family, ops, show};
+use crate::dsv::{Distinct, Doc, Dtype, Family, Filter, Op, Order, Profile, Reading, Scan, TOP, Values, arity, bin_range, date_label, family, ops, show, time_label};
 use crate::grid::{Tokens, count, sep};
 use crate::toolbar::{bare_input, btn, caption, choose, field_box, focused, icon, icon_btn, outline, panel};
 use crate::{Pane, Reader, Tab};
@@ -13,7 +14,7 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::{Disableable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -48,21 +49,53 @@ pub struct Prof {
     pub distinct: Option<Distinct>,
     /// The columns to profile; None is every column, in display order.
     pub cols: Option<Vec<usize>>,
-    /// Filled by the job's two threads, one column after the other: the basic statistics, and
-    /// the value counts (`Scan::values`), which hold the most memory, one column at a time.
-    pub out: Arc<Mutex<Vec<Profile>>>,
-    pub counts: Arc<Mutex<Vec<Values>>>,
-    /// Milliseconds, when both threads are done; and when the first card's statistics came.
-    pub ms: Arc<Mutex<Option<f64>>>,
-    pub first_ms: Arc<Mutex<Option<f64>>>,
+    /// The columns of the cards, by position, and what the job's threads did for them.
+    pub order: Vec<usize>,
+    pub work: Arc<Mutex<Work>>,
     pub rows: usize,
     /// The rows there were to profile: more than `rows` when it took the first 1,000.
     pub total: usize,
-    pub ncols: usize,
-    stop: Option<Arc<AtomicBool>>,
-    _task: Option<(Task<()>, Option<Task<()>>)>,
+    /// Every card, not only those on screen: `DSV_PROFILE` without `DSV_CARDS=screen`.
+    pub every: bool,
+    /// The card list's scroll, and the cards it had on screen in the last frame.
+    pub scroll: ScrollHandle,
+    pub visible: usize,
+    job: Option<Job>,
     /// A choice, the rows, or a type changed: profile again.
     pub dirty: bool,
+}
+
+/// What the threads of one Profile read.
+struct Job {
+    scan: Scan,
+    view: Option<Arc<Vec<u32>>>,
+    limit: Option<usize>,
+    distinct: Distinct,
+    stop: Arc<AtomicBool>,
+    t: Instant,
+}
+
+/// The cards the list asked for, and the results, by position. Thread 0 makes the basic
+/// statistics, thread 1 the Exact value counts, which hold the most memory, one column at a time
+/// (Approx counts come with the basic ones). Each takes the first asked card that it has not
+/// started, and ends when there is none: no thread runs for a card off screen.
+#[derive(Default)]
+pub struct Work {
+    asked: Vec<bool>,
+    started: [Vec<bool>; 2],
+    busy: [bool; 2],
+    out: Vec<Option<Profile>>,
+    counts: Vec<Option<Values>>,
+    /// Milliseconds: when the first card's statistics came, and how long the last cards asked
+    /// took, from the first ask after a pause (the start, or a scroll), so a pause does not count.
+    first_ms: Option<f64>,
+    ms: Option<f64>,
+    since: Option<Instant>,
+}
+
+/// The card that a thread does next: the first one asked for and not started.
+fn next_asked(asked: &[bool], started: &[bool]) -> Option<usize> {
+    asked.iter().zip(started).position(|(&a, &s)| a && !s)
 }
 
 impl Default for Prof {
@@ -72,15 +105,14 @@ impl Default for Prof {
             filters: true,
             distinct: None,
             cols: None,
-            out: Arc::default(),
-            counts: Arc::default(),
-            ms: Arc::default(),
-            first_ms: Arc::default(),
+            order: Vec::new(),
+            work: Arc::default(),
             rows: 0,
             total: 0,
-            ncols: 0,
-            stop: None,
-            _task: None,
+            every: false,
+            scroll: ScrollHandle::new(),
+            visible: 0,
+            job: None,
             dirty: true,
         }
     }
@@ -92,29 +124,117 @@ impl Prof {
         self.all.unwrap_or(total <= AUTO_ALL)
     }
 
+    /// Some asked card is not done.
     pub fn running(&self) -> bool {
-        self._task.is_some() && self.ms.lock().unwrap().is_none()
+        self.job.is_some() && self.work.lock().unwrap().ms.is_none()
     }
 
     pub fn done_ms(&self) -> Option<f64> {
-        *self.ms.lock().unwrap()
+        self.work.lock().unwrap().ms
     }
 
-    /// The columns whose basic statistics are in, with their value counts when those are in too.
+    pub fn first_ms(&self) -> Option<f64> {
+        self.work.lock().unwrap().first_ms
+    }
+
+    /// The cards by position: the basic statistics, with the value counts when those are in too.
+    pub fn cards(&self) -> Vec<Option<Profile>> {
+        let w = self.work.lock().unwrap();
+        w.out
+            .iter()
+            .zip(&w.counts)
+            .map(|(p, v)| {
+                let mut p = p.clone()?;
+                if let (false, Some(v)) = (p.counted, v) {
+                    p.count(v.clone());
+                }
+                Some(p)
+            })
+            .collect()
+    }
+
+    /// The cards whose basic statistics are in.
     pub fn merged(&self) -> Vec<Profile> {
-        let counts = self.counts.lock().unwrap();
-        let mut out = self.out.lock().unwrap().clone();
-        for (p, v) in out.iter_mut().filter(|p| !p.counted).zip(counts.iter()) {
-            p.count(v.clone());
+        self.cards().into_iter().flatten().collect()
+    }
+
+    /// Cards with statistics, cards with value counts, and cards asked for.
+    pub fn progress(&self) -> (usize, usize, usize) {
+        let w = self.work.lock().unwrap();
+        (w.out.iter().flatten().count(), w.counts.iter().flatten().count(), w.asked.iter().filter(|&&a| a).count())
+    }
+
+    /// The list drew card `i`: ask for its column. True when it was not asked before.
+    fn ask(&self, i: usize) -> bool {
+        let mut w = self.work.lock().unwrap();
+        if w.asked.get(i).is_none_or(|&a| a) {
+            return false;
         }
-        out
+        if w.ms.take().is_some() {
+            w.since = Some(Instant::now());
+        }
+        w.asked[i] = true;
+        true
+    }
+
+    /// A thread for each kind of work that has an asked card to do and no thread on it.
+    fn pump(&self, cx: &mut Context<Reader>) {
+        let Some(job) = &self.job else { return };
+        for k in 0..if job.distinct == Distinct::Exact { 2 } else { 1 } {
+            {
+                let mut w = self.work.lock().unwrap();
+                if w.busy[k] || next_asked(&w.asked, &w.started[k]).is_none() {
+                    continue;
+                }
+                w.busy[k] = true;
+            }
+            let (work, order, scan, view, limit, distinct, stop, t) = (self.work.clone(), self.order.clone(), job.scan.clone(), job.view.clone(), job.limit, job.distinct, job.stop.clone(), job.t);
+            cx.background_spawn(async move {
+                loop {
+                    let i = {
+                        let mut w = work.lock().unwrap();
+                        let Some(i) = next_asked(&w.asked, &w.started[k]) else {
+                            // The last thread to end sets the time.
+                            w.busy[k] = false;
+                            if !w.busy.contains(&true) {
+                                w.ms = Some(w.since.unwrap_or(t).elapsed().as_secs_f64() * 1e3);
+                            }
+                            return;
+                        };
+                        w.started[k][i] = true;
+                        i
+                    };
+                    let rows = view.as_deref().map(Vec::as_slice);
+                    if k == 0 {
+                        let p = scan.basic(rows, limit, order[i], distinct, &stop);
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let mut w = work.lock().unwrap();
+                        w.out[i] = Some(p);
+                        w.first_ms.get_or_insert(t.elapsed().as_secs_f64() * 1e3);
+                    } else {
+                        let v = scan.values(rows, limit, order[i], distinct, &stop);
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        work.lock().unwrap().counts[i] = Some(v);
+                    }
+                }
+            })
+            .detach();
+        }
+        // No thread to start and none running (no columns, or every asked card done): done.
+        let mut w = self.work.lock().unwrap();
+        if !w.busy.contains(&true) && w.ms.is_none() {
+            w.ms = Some(w.since.unwrap_or(job.t).elapsed().as_secs_f64() * 1e3);
+        }
     }
 
     pub fn stop(&mut self) {
-        if let Some(s) = self.stop.take() {
-            s.store(true, Ordering::Relaxed);
+        if let Some(job) = self.job.take() {
+            job.stop.store(true, Ordering::Relaxed);
         }
-        self._task = None;
     }
 }
 
@@ -128,17 +248,19 @@ pub struct FilterRow {
 fn hint(f: Family) -> &'static str {
     match f {
         Family::Date => "2024-01-31",
+        Family::Time => "0:10:00",
         Family::Number => "1.5",
         _ => "text",
     }
 }
 
 /// The step between the values a column reads to: 1 for whole numbers, 1000 ms for dates (they
-/// read to the second), 0 for decimals.
+/// read to the second), 1 ms for times, 0 for decimals.
 fn step(ty: Dtype) -> f64 {
     match ty {
         Dtype::Int => 1.0,
-        Dtype::Date => 1000.0,
+        Dtype::Date | Dtype::DateTime => 1000.0,
+        Dtype::Time => 1.0,
         _ => 0.0,
     }
 }
@@ -146,7 +268,8 @@ fn step(ty: Dtype) -> f64 {
 /// A value of a number or date column as a filter box takes it back, exactly.
 fn value_text(x: f64, ty: Dtype) -> String {
     match ty {
-        Dtype::Date => date_label(x as i64),
+        Dtype::Date | Dtype::DateTime => date_label(x as i64),
+        Dtype::Time => time_label(x as i64),
         Dtype::Int => format!("{}", x as i64),
         _ => format!("{x}"),
     }
@@ -167,7 +290,7 @@ fn histogram(p: &Profile, ty: Dtype, (lo, hi): (String, String), t: Tokens, cx: 
         .gap(px(4.))
         .child(h_flex().h(px(44.)).items_end().gap(px(2.)).children(p.hist.iter().enumerate().map(|(i, &n)| {
             let f = (n > 0).then(|| bar_filter(col, ty, span, i)).flatten();
-            let tip = f.as_ref().map(|f| format!("{} – {} · {} rows · click to filter", f.a, f.b, sep(n)));
+            let tip = f.as_ref().map(|f| format!("{} – {} · {} · click to filter", f.a, f.b, count(n, "row")));
             // The bar's whole column takes the click: a short bar stays easy to hit.
             div()
                 .id((SharedString::from(format!("bar-{col}")), i))
@@ -240,6 +363,21 @@ fn span_text(ms: f64) -> String {
 }
 
 /// One column of the Profile pane: a table of its statistics, then its value distribution.
+/// A card whose column has not come in. About as tall as a card, so the cards that fit on screen
+/// are about as many as there will be. Limit: one height for every type; a type's own height
+/// if a short card lets too many fit.
+fn waiting_card(name: &str, t: Tokens) -> Div {
+    v_flex()
+        .flex_none()
+        .h(px(480.))
+        .gap(px(8.))
+        .py(px(12.))
+        .border_b_1()
+        .border_color(t.line_soft)
+        .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(t.ink).child(name.to_string()))
+        .child(div().text_size(px(12.)).text_color(t.muted).child("Computing…"))
+}
+
 fn profile_card(doc: &Doc, p: &Profile, sampled: bool, t: Tokens, cx: &mut Context<Reader>) -> Div {
     let ty = doc.dtypes.get(p.col).copied().unwrap_or(Dtype::String);
     let pct = |k: usize| if p.rows == 0 { 0.0 } else { k as f64 * 100.0 / p.rows as f64 };
@@ -276,7 +414,7 @@ fn profile_card(doc: &Doc, p: &Profile, sampled: bool, t: Tokens, cx: &mut Conte
                 g.extend([row("Min", lo.clone(), None), row("Max", hi.clone(), None)]);
             }
             if let Some((a, m, b)) = p.len {
-                g.extend([row("Shortest", format!("{a} characters"), None), row("Longest", format!("{b} characters"), None), row("Mean length", format!("{m:.1}"), None)]);
+                g.extend([row("Shortest", count(a, "character"), None), row("Longest", count(b, "character"), None), row("Mean length", format!("{m:.1}"), None)]);
             }
             groups.push(g);
         }
@@ -292,7 +430,20 @@ fn profile_card(doc: &Doc, p: &Profile, sampled: bool, t: Tokens, cx: &mut Conte
                 ]);
             }
         }
-        Dtype::Date => {
+        Dtype::Time => {
+            if let Some(s) = p.num {
+                let at = |x: f64| time_label(x.round() as i64);
+                groups.push(vec![
+                    row("Min", at(s.min), None),
+                    row("Max", at(s.max), None),
+                    row("Mean", at(s.mean), None),
+                    row("Median", at(s.median), None),
+                    row("Std dev", at(s.std), None),
+                    row("Sum", at(s.sum), None),
+                ]);
+            }
+        }
+        Dtype::Date | Dtype::DateTime => {
             if let Some((lo, hi)) = p.span {
                 groups.push(vec![row("Earliest", date_label(lo as i64), None), row("Latest", date_label(hi as i64), None), row("Span", span_text(hi - lo), None)]);
             }
@@ -324,12 +475,16 @@ fn profile_card(doc: &Doc, p: &Profile, sampled: bool, t: Tokens, cx: &mut Conte
         (false, false) => ("Value distribution · click a bar to filter", "Value distribution · click one to filter"),
     };
     match (ty, p.span) {
-        (Dtype::Date, Some((lo, hi))) => card = card.child(caption(bars)).child(histogram(p, ty, (date_label(lo as i64), date_label(hi as i64)), t, cx)),
+        (Dtype::Date | Dtype::DateTime, Some((lo, hi))) => card = card.child(caption(bars)).child(histogram(p, ty, (date_label(lo as i64), date_label(hi as i64)), t, cx)),
+        (Dtype::Time, Some((lo, hi))) => card = card.child(caption(bars)).child(histogram(p, ty, (time_label(lo as i64), time_label(hi as i64)), t, cx)),
         (Dtype::Int | Dtype::Float, Some((lo, hi))) => card = card.child(caption(bars)).child(histogram(p, ty, (stat(lo), stat(hi)), t, cx)),
         _ => {}
     }
     if matches!(ty, Dtype::String | Dtype::Bool) && !p.counted {
-        card = card.child(caption("Value distribution · counting…"));
+        // The room the top values take (25 px a line), so the card does not grow when they come
+        // in and push the cards below it off screen after they asked for their columns.
+        let lines = if ty == Dtype::Bool { 2 } else { TOP };
+        card = card.child(caption("Value distribution · counting…")).child(div().h(px(25. * lines as f32)));
     }
     if matches!(ty, Dtype::String | Dtype::Bool) && !p.top.is_empty() {
         card = card.child(caption(values)).child(top_bars(p.col, &p.top, p.approx, t, cx));
@@ -392,6 +547,7 @@ impl Reader {
     }
 
     /// Starts the Profile for the current choices, once the index is done. A running one stops.
+    /// Only the cards on screen compute: `profile_pane` asks for them as it draws them.
     pub fn start_profile(&mut self, cx: &mut Context<Self>) {
         let Some(g) = &self.grid else { return };
         let Some(scan) = g.doc.scan() else { return };
@@ -401,60 +557,35 @@ impl Reader {
         let total = view.as_ref().map_or(scan.rows(), |v| v.len());
         let limit = (!self.prof.all_rows(total)).then_some(1000);
         let rows = total.min(limit.unwrap_or(usize::MAX));
-        self.prof.total = total;
         let distinct = self.prof.distinct.unwrap_or(recommended(rows));
-        let cols = self.prof.cols.clone().unwrap_or_else(|| g.order.clone());
-        let stop = Arc::new(AtomicBool::new(false));
-        (self.prof.out, self.prof.counts, self.prof.ms, self.prof.first_ms, self.prof.rows, self.prof.ncols, self.prof.stop) =
-            (Arc::default(), Arc::default(), Arc::default(), Arc::default(), rows, cols.len(), Some(stop.clone()));
-        // Two threads, each over every column in order: the basic statistics come fast, so the
-        // cards show early; the Exact value counts follow, one column's memory at a time (Approx
-        // counts are small and come with the basic ones). The main thread is not woken per
-        // column, so a frame in progress does not hold up the next one. Frames show the
-        // results. The last thread to finish sets the time.
-        let exact = distinct == Distinct::Exact;
-        let (t, left) = (Instant::now(), Arc::new(AtomicUsize::new(if exact { 2 } else { 1 })));
-        let finish = move |left: &AtomicUsize, ms: &Mutex<Option<f64>>| {
-            if left.fetch_sub(1, Ordering::AcqRel) == 1 {
-                *ms.lock().unwrap() = Some(t.elapsed().as_secs_f64() * 1e3);
-            }
-        };
-        let (out, ms, first, l, s, sc, v, cs) = (self.prof.out.clone(), self.prof.ms.clone(), self.prof.first_ms.clone(), left.clone(), stop.clone(), scan.clone(), view.clone(), cols.clone());
-        let basic = cx.background_spawn(async move {
-            for c in cs {
-                let p = sc.basic(v.as_deref().map(Vec::as_slice), limit, c, distinct, &s);
-                if s.load(Ordering::Relaxed) {
-                    return;
-                }
-                out.lock().unwrap().push(p);
-                first.lock().unwrap().get_or_insert(t.elapsed().as_secs_f64() * 1e3);
-            }
-            finish(&l, &ms);
-        });
-        let (counts, ms) = (self.prof.counts.clone(), self.prof.ms.clone());
-        let values = exact.then(|| {
-            cx.background_spawn(async move {
-                for c in cols {
-                    let v = scan.values(view.as_deref().map(Vec::as_slice), limit, c, distinct, &stop);
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    counts.lock().unwrap().push(v);
-                }
-                finish(&left, &ms);
-            })
-        });
-        self.prof._task = Some((basic, values));
+        let order = self.prof.cols.clone().unwrap_or_else(|| g.order.clone());
+        let n = order.len();
+        // Before the list's first layout: the first two cards.
+        let asked = (0..n).map(|i| self.prof.every || i < 2).collect();
+        let work = Work { asked, started: [vec![false; n], vec![false; n]], out: vec![None; n], counts: vec![None; n], ..Default::default() };
+        (self.prof.order, self.prof.work, self.prof.rows, self.prof.total) = (order, Arc::new(Mutex::new(work)), rows, total);
+        self.prof.job = Some(Job { scan, view, limit, distinct, stop: Arc::new(AtomicBool::new(false)), t: Instant::now() });
+        self.prof.pump(cx);
         cx.notify();
     }
 
-    /// The side pane, right of the grid or below it, with a line to drag its size; or nothing.
-    pub fn side_pane(&mut self, t: Tokens, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.panes.is_empty() || self.grid.is_none() {
-            return None;
+    /// The panes right of the grid and below it. The Profile is always on the right; the
+    /// Viewer is there too, or below the grid with `pane_bottom`.
+    pub fn side_panes(&mut self, t: Tokens, window: &mut Window, cx: &mut Context<Self>) -> (Option<AnyElement>, Option<AnyElement>) {
+        if self.grid.is_none() {
+            return (None, None);
         }
-        let bottom = self.settings.pane_bottom;
-        let panes: Vec<AnyElement> = self.panes.clone().into_iter().map(|p| self.pane(p, t, window, cx)).collect();
+        let below = self.settings.pane_bottom && self.panes.contains(&Pane::Viewer);
+        let right: Vec<Pane> = self.panes.iter().copied().filter(|&p| !(below && p == Pane::Viewer)).collect();
+        let right = (!right.is_empty()).then(|| self.pane_group(right, false, t, window, cx));
+        let below = below.then(|| self.pane_group(vec![Pane::Viewer], true, t, window, cx));
+        (right, below)
+    }
+
+    /// Panes right of the grid (`pane_size` wide) or below it (`pane_height` high), with a
+    /// line to drag that size.
+    fn pane_group(&mut self, panes: Vec<Pane>, bottom: bool, t: Tokens, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let panes: Vec<AnyElement> = panes.into_iter().map(|p| self.pane(p, t, window, cx)).collect();
         let n = panes.len();
         // With both panes: the upper one takes the `split` share, and a line between them drags it.
         let edge = div()
@@ -482,9 +613,9 @@ impl Reader {
             }
             body = body.child(if i == 0 && n == 2 { d.flex_basis(relative(self.settings.split)).flex_shrink_0() } else { d.flex_1() });
         }
-        // Its height, for a drag on the line: a share of it per pixel.
+        // Its height, for a drag on the line: a share of it per pixel. Only a group of two has the line.
         let h = self.pane_h.clone();
-        let body = body.child(canvas(move |b, _, _| h.set(f32::from(b.size.height)), |_, _, _, _| {}).absolute().size_full());
+        let body = body.when(n == 2, |b| b.child(canvas(move |b, _, _| h.set(f32::from(b.size.height)), |_, _, _, _| {}).absolute().size_full()));
         // A 1 px line to see, in a 5 px strip to grab.
         let line = div().bg(if self.pane_drag.is_some() { t.accent } else { t.line }).when(bottom, |d| d.h(px(1.)).w_full()).when(!bottom, |d| d.w(px(1.)).h_full());
         let handle = div()
@@ -499,27 +630,27 @@ impl Reader {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |r, e: &MouseDownEvent, _, cx| {
-                    let at = if r.settings.pane_bottom { e.position.y } else { e.position.x };
-                    r.pane_drag = Some((f32::from(at), r.settings.pane_size));
+                    let (at, size) = if bottom { (e.position.y, r.settings.pane_height) } else { (e.position.x, r.settings.pane_size) };
+                    r.pane_drag = Some((bottom, f32::from(at), size));
                     cx.notify();
                 }),
             );
         // A narrow window keeps 240 px for the grid, as a drag does; the saved size stays.
-        let whole = f32::from(if bottom { window.viewport_size().height } else { window.viewport_size().width });
-        let size = px(self.settings.pane_size.min((whole - 240.0).max(160.0)));
+        let (whole, set) = if bottom { (window.viewport_size().height, self.settings.pane_height) } else { (window.viewport_size().width, self.settings.pane_size) };
+        let size = px(set.min((f32::from(whole) - 240.0).max(160.0)));
         let pane = div().flex_none().bg(t.bg).overflow_hidden().when(bottom, |d| d.h(size).w_full()).when(!bottom, |d| d.w(size).h_full()).child(body);
-        Some(if bottom { v_flex().w_full().flex_none().child(handle).child(pane).into_any_element() } else { h_flex().h_full().flex_none().child(handle).child(pane).into_any_element() })
+        if bottom { v_flex().w_full().flex_none().child(handle).child(pane).into_any_element() } else { h_flex().h_full().flex_none().child(handle).child(pane).into_any_element() }
     }
 
     fn pane(&mut self, p: Pane, t: Tokens, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match p {
-            Pane::Viewer => self.viewer_pane(t, cx).into_any_element(),
+            Pane::Viewer => self.viewer_pane(t, window, cx).into_any_element(),
             Pane::Profile => self.profile_pane(t, window, cx).into_any_element(),
         }
     }
 
     /// The Record viewer: the whole active cell, or the active row as a form.
-    fn viewer_pane(&mut self, t: Tokens, cx: &mut Context<Self>) -> Div {
+    fn viewer_pane(&mut self, t: Tokens, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let tab = self.tab;
         let tabs = h_flex()
             .gap(px(6.))
@@ -555,7 +686,7 @@ impl Reader {
         let value = |c: usize| {
             let raw = row.get(c).cloned().unwrap_or_default();
             let ty = g.doc.dtypes.get(c).copied().unwrap_or(Dtype::String);
-            let rd = g.doc.reads.get(c).copied().unwrap_or(Reading { comma: false, order: Order::Ymd });
+            let rd = g.doc.reads.get(c).copied().unwrap_or(Reading { comma: false, order: Order::Ymd, short_year: false });
             let shown_as = g.fmts.get(c).and_then(|f| show(&raw, ty, rd, &f.show));
             (raw, shown_as, ty)
         };
@@ -575,7 +706,7 @@ impl Reader {
                             h_flex()
                                 .gap(px(8.))
                                 .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(t.ink).child(g.doc.names[c].clone()))
-                                .child(div().text_size(px(12.)).text_color(t.muted).child(format!("row {} · {} characters", sep(d + 1), sep(v.chars().count())))),
+                                .child(div().text_size(px(12.)).text_color(t.muted).child(format!("row {} · {}", sep(d + 1), count(v.chars().count(), "character")))),
                         )
                         .when_some(shown_as, |d, s| d.child(div().text_size(px(12.)).text_color(t.muted).child(format!("Shown as {s}"))))
                         .child(
@@ -627,13 +758,14 @@ impl Reader {
                     .child(
                         v_flex()
                             .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(t.ink).child(format!("Row {}", sep(d + 1))))
-                            .child(div().text_size(px(11.)).text_color(t.muted).child(format!("{} of {} rows", sep(s.ar + 1), sep(n)))),
+                            .child(div().text_size(px(11.)).text_color(t.muted).child(format!("{} of {}", sep(s.ar + 1), count(n, "row")))),
                     );
                 // The form: a label column (name, then type) and the value in a read-only field.
                 let fields = v_flex().id("viewer-record").flex_1().min_h_0().overflow_y_scroll().px(px(16.)).py(px(12.)).gap(px(8.)).children(shown.iter().enumerate().map(|(k, &c)| {
                     let (raw, shown_as, ty) = value(c);
                     let active = k == s.ac;
                     let text = shown_as.unwrap_or(raw);
+                    let scroll = window.use_keyed_state(("rec-scroll", c), cx, |_, _| ScrollHandle::new()).read(cx).clone();
                     let label = v_flex()
                         .w(px(112.))
                         .flex_none()
@@ -648,6 +780,16 @@ impl Reader {
                         .min_h(px(30.))
                         .max_h(px(140.))
                         .overflow_y_scroll()
+                        .track_scroll(&scroll)
+                        // gpui scrolls every area under the pointer: the list too, and it moves the field away.
+                        // The field's own scroll ran first, not yet clamped: still in its range, the field took the wheel.
+                        // Short, or at its end: the wheel goes on to the list.
+                        .on_scroll_wheel(move |_, _, cx| {
+                            let y = scroll.offset().y;
+                            if y <= px(0.) && y >= -scroll.max_offset().y {
+                                cx.stop_propagation();
+                            }
+                        })
                         .px(px(10.))
                         .py(px(5.))
                         .rounded(px(6.))
@@ -657,7 +799,21 @@ impl Reader {
                         .font(mono.clone())
                         .text_size(size)
                         .when(text.is_empty(), |d| d.text_color(t.line_strong).child("—"))
-                        .when(!text.is_empty(), |el| el.text_color(t.ink).child(SelectableText::new(("rec-text", (d * stride + c) as u64), text).selection_color(t.accent.opacity(0.25))));
+                        .when(!text.is_empty(), |el| el.text_color(t.ink).child(SelectableText::new(("rec-text", (d * stride + c) as u64), text).selection_color(t.accent.opacity(0.25))))
+                        // A press makes it the active cell, with the grid's focus: ⌘C copies it.
+                        // `prevent_default`: else the window's own focus takes the press back.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |r, _: &MouseDownEvent, window, cx| {
+                                if let Some(g) = &mut r.grid {
+                                    g.sel = Some(crate::dsv::Sel::at(s.ar, k));
+                                    g.reveal();
+                                }
+                                r.grid_focus.focus(window, cx);
+                                window.prevent_default();
+                                cx.notify();
+                            }),
+                        );
                     h_flex().items_start().gap(px(12.)).child(label).child(field)
                 }));
                 pane.child(nav).child(fields)
@@ -667,7 +823,7 @@ impl Reader {
 
     /// The Profile: statistics for each column, over the first 1,000 rows or all rows, with or
     /// without the search and filters.
-    fn profile_pane(&mut self, t: Tokens, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+    fn profile_pane(&mut self, t: Tokens, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let Some(g) = &self.grid else { return div() };
         let filtered = if self.prof.filters { g.view.as_ref().map(|v| v.len()) } else { None };
         let total = filtered.unwrap_or(g.doc.rows());
@@ -691,10 +847,19 @@ impl Reader {
                 v_flex()
                     .gap(px(6.))
                     .child(caption("Profile columns", t))
-                    .child(btn("prof-cols-all", t).h(px(26.)).px(px(8.)).child("All columns").on_click(cx.listener(|r, _: &ClickEvent, _, cx| {
-                        (r.prof.cols, r.prof.dirty) = (None, true);
-                        cx.notify();
-                    })))
+                    // None, then one tick: a profile of one column.
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .child(btn("prof-cols-all", t).flex_1().h(px(26.)).px(px(8.)).child("All columns").on_click(cx.listener(|r, _: &ClickEvent, _, cx| {
+                                (r.prof.cols, r.prof.dirty) = (None, true);
+                                cx.notify();
+                            })))
+                            .child(btn("prof-cols-none", t).flex_1().h(px(26.)).px(px(8.)).child("None").on_click(cx.listener(|r, _: &ClickEvent, _, cx| {
+                                (r.prof.cols, r.prof.dirty) = (Some(Vec::new()), true);
+                                cx.notify();
+                            }))),
+                    )
                     .child(div().id("prof-cols-list").max_h(px(360.)).overflow_y_scroll().children(list.into_iter().map(|(c, name, on)| {
                         Checkbox::new(("prof-col", c)).label(name).checked(on).py(px(3.)).on_change(cx.listener(move |r, on: &bool, _, cx| {
                             let order = r.grid.as_ref().map_or(Vec::new(), |g| g.order.clone());
@@ -764,25 +929,36 @@ impl Reader {
                 )
             })
             .when(distinct == Distinct::Approx, |d| d.child(div().text_size(px(12.)).text_color(t.muted).child("Approximate: the distinct count and the top values are estimates (about 1% error).")))
-            .child(div().text_size(px(12.)).text_color(t.muted).child(match (self.prof._task.is_some(), self.prof.done_ms()) {
-                (false, _) => "The profile starts when the index is done.".to_string(),
-                (true, Some(ms)) if self.prof.rows < self.prof.total => {
-                    format!("the first {} of {} · {} · {ms:.0} ms", sep(self.prof.rows), count(self.prof.total, "row"), count(self.prof.ncols, "column"))
+            .child(div().text_size(px(12.)).text_color(t.muted).child({
+                let ((done, counted, asked), n) = (self.prof.progress(), self.prof.order.len());
+                let cols = if done < n { format!("{done} of {} · the others when you scroll to them", count(n, "column")) } else { count(n, "column") };
+                match (self.prof.job.is_some(), self.prof.done_ms()) {
+                    (false, _) => "The profile starts when the index is done.".to_string(),
+                    (true, Some(ms)) if self.prof.rows < self.prof.total => format!("the first {} of {} · {cols} · {ms:.0} ms", sep(self.prof.rows), count(self.prof.total, "row")),
+                    (true, Some(ms)) => format!("{} · {cols} · {ms:.0} ms", count(self.prof.rows, "row")),
+                    (true, None) => format!("{} · statistics {done} of {asked} · value counts {counted} of {asked}…", count(self.prof.rows, "row")),
                 }
-                (true, Some(ms)) => format!("{} · {} · {ms:.0} ms", count(self.prof.rows, "row"), count(self.prof.ncols, "column")),
-                (true, None) => format!(
-                    "{} · statistics {} of {} · value counts {} of {}…",
-                    count(self.prof.rows, "row"),
-                    self.prof.out.lock().unwrap().len(),
-                    self.prof.ncols,
-                    self.prof.counts.lock().unwrap().len(),
-                    self.prof.ncols
-                ),
             }));
         let doc = g.doc.clone();
-        let out = self.prof.merged();
+        let cards = self.prof.cards();
+        // The cards on screen in the last frame, and the one below them, ask for their columns.
+        let (view, dy) = (self.prof.scroll.bounds(), self.prof.scroll.offset().y);
+        let on: Vec<usize> = (0..cards.len()).filter(|&i| self.prof.scroll.bounds_for_item(i).is_some_and(|b| b.top() + dy < view.bottom() && b.bottom() + dy > view.top())).collect();
+        self.prof.visible = on.len();
+        if on.iter().fold(false, |new, &i| self.prof.ask(i) | self.prof.ask(i + 1) | new) {
+            self.prof.pump(cx);
+            window.request_animation_frame();
+        }
         let sampled = self.prof.rows < self.prof.total;
-        let cards = v_flex().id("profile-cards").flex_1().min_h_0().overflow_y_scroll().px(px(16.)).children(out.iter().map(|p| profile_card(&doc, p, sampled, t, cx)));
+        let list: Vec<Div> = cards
+            .iter()
+            .zip(&self.prof.order)
+            .map(|(p, &c)| match p {
+                Some(p) => profile_card(&doc, p, sampled, t, cx),
+                None => waiting_card(doc.names.get(c).map_or("", String::as_str), t),
+            })
+            .collect();
+        let cards = v_flex().id("profile-cards").track_scroll(&self.prof.scroll).flex_1().min_h_0().overflow_y_scroll().px(px(16.)).children(list);
         v_flex().size_full().child(head).child(controls).child(cards)
     }
 
@@ -929,6 +1105,15 @@ mod tests {
             [span_text(0.0), span_text(1000.0), span_text(775_070_000.0), span_text(2_469_000.0), span_text(86_400_000.0), span_text(9128.0 * 86_400_000.0)],
             ["0 seconds", "1 second", "8 days 23 hours", "41 minutes 9 seconds", "1 day", "25.0 years (9,128 days)"]
         );
+    }
+    #[test]
+    fn a_thread_takes_the_first_asked_card_it_has_not_started() {
+        use super::next_asked;
+        let asked = [true, false, true, true];
+        assert_eq!(next_asked(&asked, &[false; 4]), Some(0));
+        assert_eq!(next_asked(&asked, &[true, false, false, false]), Some(2));
+        assert_eq!(next_asked(&asked, &[true, false, true, true]), None);
+        assert_eq!(next_asked(&[], &[]), None);
     }
     #[test]
     fn a_top_value_filters_to_itself() {

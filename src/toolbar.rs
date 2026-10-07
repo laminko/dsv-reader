@@ -317,7 +317,7 @@ impl Reader {
         let view = cx.entity();
         icon_btn("more", IconName::Ellipsis, "More", t).dropdown_menu(move |mut menu, window, cx| {
             let r = view.read(cx);
-            let (has, viewer, profile, size, theme, font) = (r.grid.is_some(), r.viewer, r.profile, r.settings.size, r.settings.theme, r.settings.font.clone());
+            let (has, viewer, profile, size, theme, font, zebra) = (r.grid.is_some(), r.viewer, r.profile, r.settings.size, r.settings.theme, r.settings.font.clone(), r.settings.zebra);
             let cols: Vec<(usize, String, bool)> = match (&r.grid, tools.contains(&Tool::Columns)) {
                 (Some(g), true) => g.order.iter().map(|&c| (c, g.doc.names[c].clone(), !g.hidden[c])).collect(),
                 _ => Vec::new(),
@@ -397,6 +397,8 @@ impl Reader {
                                 let v = v.clone();
                                 m = m.item(PopupMenuItem::new(th.name()).checked(th == theme).on_click(move |_, window, cx| v.update(cx, |r, cx| r.set_theme(th, window, cx))));
                             }
+                            let z = v.clone();
+                            m = m.separator().item(PopupMenuItem::new("Zebra rows").checked(zebra).on_click(move |_, _, cx| z.update(cx, |r, cx| r.set_zebra(!zebra, cx))));
                             let (v, fonts, font) = (v.clone(), fonts.clone(), font.clone());
                             m.separator().submenu("Grid font", window, cx, move |mut f, _, _| {
                                 for (name, p) in fonts.clone() {
@@ -662,7 +664,8 @@ impl Reader {
                             "Theme",
                             t,
                             choose("theme", (false, self.settings.theme.name().to_string()), themes, self.settings.theme, view, t, |r: &mut Reader, th, w, cx| r.set_theme(th, w, cx)),
-                        )),
+                        ))
+                        .child(labelled("Rows", t, Checkbox::new("zebra").label("Zebra rows").checked(self.settings.zebra).on_change(cx.listener(|r, on: &bool, _, cx| r.set_zebra(*on, cx))))),
                     cx,
                 ),
             )

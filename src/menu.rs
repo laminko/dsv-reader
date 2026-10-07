@@ -1,20 +1,25 @@
 //! The column menu (a right-click on a column name): the type when detection is wrong, and how
 //! the cells show. The same choices as the egui app's menu, in the toolbar's popover style.
 
-use crate::Reader;
 use crate::dsv::{DatePat, Dtype, Family, Kind, Order, Reading, Show, TimePat, Unit, family};
-use crate::grid::{Tokens, fits};
+use crate::grid::{Tokens, count, fits, sep};
+use crate::{Pane, Reader};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+/// A date written in each order, by `Order as usize`: day 31 can only be a day.
+const READ_AS: [&str; 3] = ["31/01/2024", "01/31/2024", "2024-01-31"];
+
 /// What detection found, in words.
 fn type_name(t: Dtype, r: Reading) -> String {
     match t {
-        Dtype::Int | Dtype::Float if r.comma => "number, decimal comma".into(),
+        Dtype::Int | Dtype::Float if r.comma => "number (1,5)".into(),
         Dtype::Int | Dtype::Float => "number".into(),
-        Dtype::Date => format!("date, {}", ["DMY", "MDY", "YMD"][r.order as usize]),
+        Dtype::Date => format!("date ({})", READ_AS[r.order as usize]),
+        Dtype::DateTime => format!("date & time ({})", READ_AS[r.order as usize]),
+        Dtype::Time => "time".into(),
         Dtype::Bool => "yes-no".into(),
         Dtype::String => "text".into(),
     }
@@ -78,7 +83,7 @@ impl Reader {
         let mut types = v_flex()
             .gap(px(2.))
             .child(caption("Type", t))
-            .child(radio("k-auto", kind == Kind::Auto, format!("Auto: {}", type_name(found, read)), t).on_click(set_kind(Kind::Auto)))
+            .child(radio("k-auto", kind == Kind::Auto, format!("Auto, detected: {}", type_name(found, read)), t).on_click(set_kind(Kind::Auto)))
             .child(radio("k-text", kind == Kind::Text, "Text", t).on_click(set_kind(Kind::Text)))
             .child(radio("k-num", matches!(kind, Kind::Number { .. }), "Number", t).on_click(set_kind(match kind {
                 Kind::Number { .. } => kind,
@@ -86,26 +91,50 @@ impl Reader {
             })));
         if let Kind::Number { comma } = kind {
             types = types.child(
-                chips("Decimal symbol", t)
-                    .child(chip("dec-dot", !comma, ".", t).on_click(set_kind(Kind::Number { comma: false })))
-                    .child(chip("dec-comma", comma, ",", t).on_click(set_kind(Kind::Number { comma: true }))),
+                chips("Read as", t)
+                    .child(chip("dec-dot", !comma, "1.5", t).on_click(set_kind(Kind::Number { comma: false })))
+                    .child(chip("dec-comma", comma, "1,5", t).on_click(set_kind(Kind::Number { comma: true }))),
             );
         }
-        types = types.child(radio("k-date", matches!(kind, Kind::Date { .. }), "Date", t).on_click(set_kind(match kind {
-            Kind::Date { .. } => kind,
-            _ => Kind::Date { order: read.order },
-        })));
-        if let Kind::Date { order } = kind {
-            let mut row = chips("Order", t);
-            for (o, name) in [(Order::Dmy, "DMY"), (Order::Mdy, "MDY"), (Order::Ymd, "YMD")] {
-                row = row.child(chip(name, order == o, name, t).on_click(set_kind(Kind::Date { order: o })));
+        for (id, label, timed) in [("k-date", "Date", false), ("k-datetime", "Date & Time", true)] {
+            let make = |order| if timed { Kind::DateTime { order } } else { Kind::Date { order } };
+            let on = match kind {
+                Kind::Date { order } | Kind::DateTime { order } if make(order) == kind => Some(order),
+                _ => None,
+            };
+            types = types.child(radio(id, on.is_some(), label, t).on_click(set_kind(make(on.unwrap_or(read.order)))));
+            if let Some(order) = on {
+                let mut row = chips("Read as", t);
+                for o in [Order::Dmy, Order::Mdy, Order::Ymd] {
+                    let name = READ_AS[o as usize];
+                    row = row.child(chip(name, order == o, name, t).on_click(set_kind(make(o))));
+                }
+                types = types.child(row);
             }
-            types = types.child(row);
         }
+        types = types.child(radio("k-time", kind == Kind::Time, "Time", t).on_click(set_kind(Kind::Time)));
         types = types.child(radio("k-bool", kind == Kind::Bool, "Yes-No", t).on_click(set_kind(Kind::Bool)));
+        // A type set by hand can read few cells: say so, as those keep the file's text.
+        let (ok, all, cut) = g.doc.sample_reads(c);
+        if kind.typed().is_some_and(|k| k.0 != Dtype::String) && ok < all {
+            let first = if cut { " in the first 1,000 rows" } else { "" };
+            types =
+                types.child(div().px(px(8.)).pt(px(4.)).text_size(px(12.)).text_color(t.muted).child(format!("Reads {} of {}{first}. The rest show as in the file.", sep(ok), count(all, "value"))));
+        }
 
         let s = if fits(&f.show, ty) { f.show.clone() } else { Show::Plain };
         let same = |a: &Show, b: &Show| std::mem::discriminant(a) == std::mem::discriminant(b);
+        let times = |tp: TimePat, make: &dyn Fn(TimePat) -> Show| {
+            let mut row = chips("Time", t);
+            for (v, name) in [(TimePat::Hm, "14:05"), (TimePat::Hms, "14:05:09"), (TimePat::H12, "2:05 PM")] {
+                row = row.child(chip(name, tp == v, name, t).on_click(set_show(make(v))));
+            }
+            row
+        };
+        let time_of_day = radio("s-time", matches!(s, Show::Time(_)), "Time of day", t).on_click(set_show(match s {
+            Show::Time(_) => s.clone(),
+            _ => Show::Time(TimePat::Hm),
+        }));
         let mut shows = v_flex().gap(px(2.)).child(caption("Show", t));
         match family(ty) {
             Family::Number => {
@@ -177,6 +206,12 @@ impl Reader {
                         Show::DateTime(..) => s.clone(),
                         _ => Show::DateTime(DatePat::Iso, TimePat::Hm),
                     })));
+                if ty == Dtype::DateTime {
+                    shows = shows.child(time_of_day);
+                }
+                if let Show::Time(tp) = s {
+                    shows = shows.child(times(tp, &Show::Time));
+                }
                 if let Show::Date(p) | Show::DateTime(p, _) = s {
                     let time = match s {
                         Show::DateTime(_, tp) => Some(tp),
@@ -189,12 +224,27 @@ impl Reader {
                     }
                     shows = shows.child(row);
                     if let Some(tp) = time {
-                        let mut row = chips("Time", t);
-                        for (v, name) in [(TimePat::Hm, "14:05"), (TimePat::Hms, "14:05:09"), (TimePat::H12, "2:05 PM")] {
-                            row = row.child(chip(name, tp == v, name, t).on_click(set_show(Show::DateTime(p, v))));
-                        }
-                        shows = shows.child(row);
+                        shows = shows.child(times(tp, &|v| Show::DateTime(p, v)));
                     }
+                }
+            }
+            Family::Time => {
+                shows = shows.child(radio("s-plain", s == Show::Plain, "As in the file", t).on_click(set_show(Show::Plain))).child(
+                    radio("s-duration", matches!(s, Show::Duration { .. }), "Duration", t).on_click(set_show(match s {
+                        Show::Duration { .. } => s.clone(),
+                        _ => Show::Duration { unit: Unit::Ms, words: false },
+                    })),
+                );
+                if let Show::Duration { unit, words } = s {
+                    shows = shows.child(
+                        chips("Show as", t)
+                            .child(chip("clock", !words, "1:02:03", t).on_click(set_show(Show::Duration { unit, words: false })))
+                            .child(chip("words", words, "1h 2m 3s", t).on_click(set_show(Show::Duration { unit, words: true }))),
+                    );
+                }
+                shows = shows.child(time_of_day);
+                if let Show::Time(tp) = s {
+                    shows = shows.child(times(tp, &Show::Time));
                 }
             }
             Family::Bool => {
@@ -225,6 +275,19 @@ impl Reader {
             .child(types)
             .child(div().h(px(1.)).bg(t.line_soft))
             .child(shows)
+            .child(div().h(px(1.)).bg(t.line_soft))
+            .child(h_flex().id("profile-col").h(px(28.)).px(px(8.)).rounded(px(6.)).text_size(px(12.5)).text_color(t.ink).hover(|s| s.bg(t.hover)).child("Profile this column").on_click(cx.listener(
+                move |r: &mut Reader, _: &ClickEvent, _, cx| {
+                    if let Some(g) = &mut r.grid {
+                        g.menu = None;
+                    }
+                    (r.prof.cols, r.prof.dirty) = (Some(vec![c]), true);
+                    if !r.profile {
+                        r.toggle_pane(Pane::Profile, cx);
+                    }
+                    cx.notify();
+                },
+            )))
             .on_mouse_down_out(cx.listener(|r: &mut Reader, _: &MouseDownEvent, _, cx| {
                 if let Some(g) = &mut r.grid {
                     g.menu = None;

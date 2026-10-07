@@ -5,7 +5,7 @@ use memchr::{memchr2, memchr3, memmem};
 use rayon::prelude::*;
 use std::cmp::Ordering as Cmp;
 use std::collections::{HashMap, HashSet};
-use std::ops::Deref;
+use std::ops::{Deref, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,9 @@ pub enum Dtype {
     Float,
     Bool,
     Date,
+    /// A date with a time of day written in the file.
+    DateTime,
+    Time,
     String,
 }
 
@@ -27,6 +30,8 @@ impl Dtype {
             Dtype::Float => "float",
             Dtype::Bool => "bool",
             Dtype::Date => "date",
+            Dtype::DateTime => "datetime",
+            Dtype::Time => "time",
             Dtype::String => "string",
         }
     }
@@ -39,11 +44,13 @@ pub enum Order {
     Ymd,
 }
 
-/// How one column writes values: a decimal comma or not, and the date part order.
+/// How one column writes values: a decimal comma or not, the date part order, and whether a
+/// 2-digit year reads (a date type set by hand only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reading {
     pub comma: bool,
     pub order: Order,
+    pub short_year: bool,
 }
 
 /// The user's read-format choices. `None` is "auto", decided per column.
@@ -346,16 +353,45 @@ fn is_bool(v: &str) -> bool {
     v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false")
 }
 
-/// The parts of `(\d{1,4})([-/.])(\d{1,2})\2(\d{1,4})` and an optional
-/// `[T ]h:mm(:ss)?(.f+)?(Z|±hh:?mm)?`, case ignored, as ([a, b, c], [h, m, s]).
-fn date_parts(s: &str) -> Option<([&str; 3], [i64; 3])> {
+/// A month name or its first 3 letters, case ignored, as 1 to 12.
+fn month(w: &str) -> Option<i64> {
+    const NAMES: [&str; 12] = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+    NAMES.iter().position(|m| m.eq_ignore_ascii_case(w) || (w.len() == 3 && m[..3].eq_ignore_ascii_case(w))).map(|i| i as i64 + 1)
+}
+
+/// The date at the start of `s`, as [y, m, d] and its end. Four forms: `(\d{1,4})([-/.])(\d{1,2})\2(\d{1,4})`
+/// in part order `order`, the year 4 digits (or 2 with `short_year`); `yyyymmdd` before a `T`, year first only; `d Mon yyyy`;
+/// `Mon d, yyyy`, the comma optional. A month name reads in any order.
+fn date_head(s: &str, order: Order, short_year: bool) -> Option<([i64; 3], usize)> {
     let b = s.as_bytes();
+    let num = |a: usize, e: usize| s[a..e].parse::<i64>().ok();
     let a_end = digits(b, 0);
-    if !(1..=4).contains(&a_end) {
-        return None;
+    if a_end == 0 {
+        let m_end = b.iter().position(|&c| c == b' ')?;
+        let mo = month(&s[..m_end])?;
+        let d_end = digits(b, m_end + 1);
+        let y0 = if b.get(d_end) == Some(&b',') { d_end + 1 } else { d_end };
+        if !(1..=2).contains(&(d_end - m_end - 1)) || b.get(y0) != Some(&b' ') {
+            return None;
+        }
+        let y_end = digits(b, y0 + 1);
+        return (y_end - y0 == 5).then(|| Some(([num(y0 + 1, y_end)?, mo, num(m_end + 1, d_end)?], y_end))).flatten();
+    }
+    if a_end == 8 && matches!(b.get(8), Some(b'T' | b't')) {
+        return (order == Order::Ymd).then(|| Some(([num(0, 4)?, num(4, 6)?, num(6, 8)?], 8))).flatten();
     }
     let sep = *b.get(a_end)?;
-    if !matches!(sep, b'-' | b'/' | b'.') {
+    if sep == b' ' && a_end <= 2 {
+        let m0 = a_end + 1;
+        let m_end = m0 + b[m0..].iter().take_while(|c| c.is_ascii_alphabetic()).count();
+        let mo = month(&s[m0..m_end])?;
+        if b.get(m_end) != Some(&b' ') {
+            return None;
+        }
+        let y_end = digits(b, m_end + 1);
+        return (y_end - m_end == 5).then(|| Some(([num(m_end + 1, y_end)?, mo, num(0, a_end)?], y_end))).flatten();
+    }
+    if !(1..=4).contains(&a_end) || !matches!(sep, b'-' | b'/' | b'.') {
         return None;
     }
     let b0 = a_end + 1;
@@ -368,53 +404,86 @@ fn date_parts(s: &str) -> Option<([&str; 3], [i64; 3])> {
     if !(1..=4).contains(&(c_end - c0)) {
         return None;
     }
-    let parts = [&s[..a_end], &s[b0..b_end], &s[c0..c_end]];
-    if c_end == b.len() {
-        return Some((parts, [0; 3]));
-    }
-    if !matches!(b[c_end], b'T' | b't' | b' ') {
+    let (y_len, d_len) = if order == Order::Ymd { (a_end, c_end - c0) } else { (c_end - c0, a_end) };
+    if !(y_len == 4 || short_year && y_len == 2) || d_len > 2 {
         return None;
     }
-    let h0 = c_end + 1;
-    let h_end = digits(b, h0);
-    if !(1..=2).contains(&(h_end - h0)) || b.get(h_end) != Some(&b':') {
-        return None;
-    }
-    let m0 = h_end + 1;
-    let mut i = digits(b, m0);
-    if i - m0 != 2 {
-        return None;
-    }
-    let mut sec = 0;
-    if b.get(i) == Some(&b':') {
-        let e = digits(b, i + 1);
-        if e - (i + 1) != 2 {
-            return None;
-        }
-        sec = s[i + 1..e].parse().ok()?;
-        i = e;
-    }
-    if b.get(i) == Some(&b'.') {
-        let e = digits(b, i + 1);
-        if e == i + 1 {
-            return None;
-        }
-        i = e;
-    }
-    match b.get(i) {
-        Some(b'Z' | b'z') => i += 1,
+    let (a, m, c) = (num(0, a_end)?, num(b0, b_end)?, num(c0, c_end)?);
+    let [y, mo, d] = match order {
+        Order::Ymd => [a, m, c],
+        Order::Dmy => [c, m, a],
+        Order::Mdy => [c, a, m],
+    };
+    // A 2-digit year as `%y` reads it: 00–68 are 2000–2068, 69–99 are 1969–1999.
+    let y = if y_len == 2 { y + if y < 69 { 2000 } else { 1900 } } else { y };
+    Some(([y, mo, d], c_end))
+}
+
+/// A zone, ignored: an optional space, then `Z`, `±hh`, `±hhmm`, or `±hh:mm` (hh up to 14, mm below 60).
+/// The end of the zone, `i` without one, or None for a bad zone.
+fn zone(b: &[u8], i: usize) -> Option<usize> {
+    let j = if b.get(i) == Some(&b' ') && matches!(b.get(i + 1), Some(b'Z' | b'z' | b'+' | b'-')) { i + 1 } else { i };
+    match b.get(j) {
+        Some(b'Z' | b'z') => Some(j + 1),
         Some(b'+' | b'-') => {
-            let e = digits(b, i + 1);
-            i = match e - (i + 1) {
-                4 => e,
-                2 if b.get(e) == Some(&b':') && digits(b, e + 1) == e + 3 => e + 3,
+            let n = |a: usize| i64::from(b[a] - b'0') * 10 + i64::from(b[a + 1] - b'0');
+            let e = digits(b, j + 1);
+            let (end, mm) = match e - j - 1 {
+                2 if b.get(e) == Some(&b':') && digits(b, e + 1) == e + 3 => (e + 3, n(e + 1)),
+                2 => (e, 0),
+                4 => (e, n(j + 3)),
                 _ => return None,
             };
+            (n(j + 1) <= 14 && mm < 60).then_some(end)
         }
-        _ => {}
+        _ => Some(i),
     }
-    let hm = [s[h0..h_end].parse().ok()?, s[m0..m0 + 2].parse().ok()?, sec];
-    (i == b.len()).then_some((parts, hm))
+}
+
+/// A time of day from byte `i` to the end of `s`, as [h, m, s, ms]: `h:mm(:ss(.f+)?)?`, or
+/// `hhmm(ss)?(.f+)?` when `compact`, then ` ?(AM|PM)` (case ignored) and a [`zone`], both optional.
+/// `hours`: how many digits h can have. Minutes and seconds are 2 digits below 60. With AM or PM,
+/// h is 1 to 12. Digits past the milliseconds are cut.
+fn clock(s: &str, i: usize, hours: RangeInclusive<usize>, compact: bool) -> Option<[i64; 4]> {
+    let b = s.as_bytes();
+    let two = |a: usize| s.get(a..a + 2).filter(|t| t.bytes().all(|c| c.is_ascii_digit())).and_then(|t| t.parse::<i64>().ok()).filter(|&n| n < 60);
+    let (h_end, mi, sec, mut j);
+    if compact {
+        let e = digits(b, i);
+        if !matches!(e - i, 4 | 6) {
+            return None;
+        }
+        (h_end, mi, j) = (i + 2, two(i + 2)?, e);
+        sec = if e - i == 6 { Some(two(i + 4)?) } else { None };
+    } else {
+        h_end = digits(b, i);
+        if !hours.contains(&(h_end - i)) || b.get(h_end) != Some(&b':') {
+            return None;
+        }
+        (mi, j) = (two(h_end + 1)?, h_end + 3);
+        sec = if b.get(j) == Some(&b':') { Some(two(j + 1)?) } else { None };
+        j += if sec.is_some() { 3 } else { 0 };
+    }
+    let mut ms = 0;
+    if sec.is_some() && b.get(j) == Some(&b'.') {
+        let e = digits(b, j + 1);
+        if e == j + 1 {
+            return None;
+        }
+        let k = e.min(j + 4);
+        ms = b[j + 1..k].iter().fold(0, |n, c| n * 10 + i64::from(c - b'0')) * 10_i64.pow((j + 4 - k) as u32);
+        j = e;
+    }
+    let mut h = s[i..h_end].parse::<i64>().ok()?;
+    let k = j + usize::from(b.get(j) == Some(&b' '));
+    if let Some(w) = s.get(k..k + 2).filter(|w| w.eq_ignore_ascii_case("am") || w.eq_ignore_ascii_case("pm")) {
+        if !(1..=12).contains(&h) {
+            return None;
+        }
+        h = h % 12 + if w.eq_ignore_ascii_case("pm") { 12 } else { 0 };
+        j = k + 2;
+    }
+    (zone(b, j)? == b.len()).then_some([h, mi, sec.unwrap_or(0), ms])
 }
 
 /// Days from 1970-01-01 to a proleptic Gregorian date (H. Hinnant's `days_from_civil`).
@@ -426,31 +495,45 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
 }
 
-// ponytail: time-zone offsets are ignored; parse them when a file mixes zones.
+// Limit: time-zone offsets are ignored; parse them when a file mixes zones.
 /**
  * UTC milliseconds for a date in part order `order`, as `Date.UTC` gives them.
- * The year has 4 digits. The parts are split by `-`, `/`, or `.`, the same one
- * twice. A time may follow.
+ * The forms are in [`date_head`]. A time may follow, after `T`, a space, or ", ": see [`clock`].
  */
 pub fn to_date(v: &str, order: Order) -> Option<i64> {
-    let ([a, b, c], [h, mi, s]) = date_parts(v.trim())?;
-    let ymd = order == Order::Ymd;
-    if (if ymd { a } else { c }).len() != 4 || (if ymd { c } else { a }).len() > 2 {
-        return None;
-    }
-    let (y, mo, d) = match order {
-        Order::Ymd => (a, b, c),
-        Order::Dmy => (c, b, a),
-        Order::Mdy => (c, a, b),
-    };
-    let (y, mo, d): (i64, i64, i64) = (y.parse().ok()?, mo.parse().ok()?, d.parse().ok()?);
+    date_time(v, order, false).map(|(ms, _)| ms)
+}
+
+/// [`to_date`] with the order of a column's reading, and its 2-digit years when the type was set by hand.
+fn read_date(v: &str, r: &Reading) -> Option<i64> {
+    date_time(v, r.order, r.short_year).map(|(ms, _)| ms)
+}
+
+/// [`to_date`], and whether a time of day follows the date.
+fn date_time(v: &str, order: Order, short_year: bool) -> Option<(i64, bool)> {
+    let s = v.trim();
+    let b = s.as_bytes();
+    let ([y, mo, d], end) = date_head(s, order, short_year)?;
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
         return None;
     }
+    let [h, mi, sec, _] = match b.get(end) {
+        None => [0; 4],
+        Some(b'T' | b't' | b' ') => clock(s, end + 1, 1..=2, digits(b, 0) == 8)?,
+        Some(b',') if b.get(end + 1) == Some(&b' ') => clock(s, end + 2, 1..=2, false)?,
+        _ => return None,
+    };
     // Date.UTC reads years 0–99 as 1900–1999, and a day past the month's end rolls over.
     let y = if y <= 99 { 1900 + y } else { y };
     let days = days_from_civil(y, mo, 1) + d - 1;
-    Some((((days * 24 + h) * 60 + mi) * 60 + s) * 1000)
+    Some(((((days * 24 + h) * 60 + mi) * 60 + sec) * 1000, end < b.len()))
+}
+
+/// Milliseconds in a time of day or a duration, `h+:mm(:ss(.f+)?)?`: "14:05", "00:02:05.881533",
+/// "100:00:00". An AM or PM ("2:05 PM") and a zone ("09:05:48+00", ignored) can follow: see [`clock`].
+pub fn to_time(v: &str) -> Option<i64> {
+    let [h, mi, sec, ms] = clock(v.trim(), 0, 1..=9, false)?;
+    Some(((h * 60 + mi) * 60 + sec) * 1000 + ms)
 }
 
 /// Whether a trimmed value is of dtype `t` when read with `r`.
@@ -459,20 +542,21 @@ fn fits(t: Dtype, r: &Reading, v: &str) -> bool {
         Dtype::Bool => is_bool(v),
         Dtype::Int => is_int(v),
         Dtype::Float => is_float(v, if r.comma { b',' } else { b'.' }),
-        Dtype::Date => to_date(v, r.order).is_some(),
+        Dtype::Date | Dtype::DateTime => read_date(v, r).is_some(),
+        Dtype::Time => to_time(v).is_some(),
         Dtype::String => true,
     }
 }
 
 /**
- * The first of bool, int, float, date that ≥95% of up to 1,000 non-empty
+ * The first of bool, int, float, date, time that ≥95% of up to 1,000 non-empty
  * values match, else string. Empty cells are nulls. Auto decimal tries "."
  * then ",". Auto date order takes the order that reads the most values; a
  * tie (every day and month ≤ 12) goes to DMY.
  */
 pub fn infer_column<'a>(values: impl IntoIterator<Item = &'a str>, f: &Format) -> (Dtype, Reading) {
     let sample: Vec<&str> = values.into_iter().map(str::trim).filter(|s| !s.is_empty()).take(1000).collect();
-    let base = Reading { comma: f.comma.unwrap_or(false), order: f.order.unwrap_or(Order::Ymd) };
+    let base = Reading { comma: f.comma.unwrap_or(false), order: f.order.unwrap_or(Order::Ymd), short_year: false };
     if sample.is_empty() {
         return (Dtype::String, base);
     }
@@ -507,7 +591,12 @@ pub fn infer_column<'a>(values: impl IntoIterator<Item = &'a str>, f: &Format) -
             best = read;
         }
     }
-    if top > 0 && enough(top) { (Dtype::Date, best) } else { (Dtype::String, base) }
+    if top > 0 && enough(top) {
+        // A written time of day after the date makes a date & time.
+        let timed = sample.iter().any(|v| date_time(v, best.order, false).is_some_and(|(_, t)| t));
+        return (if timed { Dtype::DateTime } else { Dtype::Date }, best);
+    }
+    if enough(hits(Dtype::Time, &base)) { (Dtype::Time, base) } else { (Dtype::String, base) }
 }
 
 fn column(rows: &[Vec<String>], c: usize) -> impl Iterator<Item = &str> {
@@ -675,10 +764,10 @@ pub struct Doc {
 
 impl Doc {
     /// Maps the file, decodes it when it is not UTF-8, and calls `from_bytes`.
-    // ponytail: a file in another encoding decodes on this thread before the first paint; decode on the index thread if that is slow.
+    // Limit: a file in another encoding decodes on this thread before the first paint; decode on the index thread if that is slow.
     pub fn open(path: &Path, opts: &Opts, notify: impl Fn() + Send + 'static) -> std::io::Result<Doc> {
         let file = std::fs::File::open(path)?;
-        // ponytail: a mapped file that shrinks on disk while open can crash the app (SIGBUS); copy it if that matters.
+        // Limit: a mapped file that shrinks on disk while open can crash the app (SIGBUS); copy it if that matters.
         let map = if file.metadata()?.len() == 0 { None } else { Some(unsafe { memmap2::Mmap::map(&file)? }) };
         let raw: &[u8] = map.as_deref().unwrap_or(&[]);
         let encoding = opts.encoding.unwrap_or(match raw {
@@ -707,6 +796,19 @@ impl Doc {
         };
         let sample = head_rows(&data, delim.as_bytes(), opts.quote.as_bytes(), 1001);
         let index = Arc::new(Index::default());
+        // A cold file: the kernel reads it ahead of the index, not one page fault at a time. On
+        // its own thread, because `WillNeed` waits until the whole file is read, and the first
+        // rows must not. Not `Sequential`: it let macOS drop pages behind the index, so a later
+        // search of one column was 8 % slower. Limit: it asks for the whole file, so a file near
+        // the memory size can push other files out of the cache.
+        if matches!(&*data, Bytes::Map(_)) {
+            let ahead = data.clone();
+            std::thread::spawn(move || {
+                if let Bytes::Map(m) = &*ahead {
+                    m.advise(memmap2::Advice::WillNeed).ok();
+                }
+            });
+        }
         let (b, idx, d, q) = (data.clone(), index.clone(), delim.clone(), opts.quote.clone());
         std::thread::spawn(move || {
             let (d, q) = (d.as_bytes(), q.as_bytes());
@@ -870,13 +972,15 @@ pub enum Show {
         symbol: String,
         places: Option<u8>,
     },
-    /// `words`: "1h 2m 3s"; else "1:02:03".
+    /// `words`: "1h 2m 3s"; else "1:02:03". A time column holds ms: its `unit` is not used.
     Duration {
         unit: Unit,
         words: bool,
     },
     Date(DatePat),
     DateTime(DatePat, TimePat),
+    /// A time column as a time of day.
+    Time(TimePat),
     /// `ticks`: ✓ and × (no loaded font draws ✗); else Yes and No.
     YesNo {
         ticks: bool,
@@ -890,6 +994,8 @@ pub enum Kind {
     Text,
     Number { comma: bool },
     Date { order: Order },
+    DateTime { order: Order },
+    Time,
     Bool,
 }
 
@@ -899,8 +1005,10 @@ impl Kind {
         match self {
             Kind::Auto => None,
             Kind::Text => Some((Dtype::String, PLAIN)),
-            Kind::Number { comma } => Some((Dtype::Float, Reading { comma, order: Order::Ymd })),
-            Kind::Date { order } => Some((Dtype::Date, Reading { comma: false, order })),
+            Kind::Number { comma } => Some((Dtype::Float, Reading { comma, order: Order::Ymd, short_year: false })),
+            Kind::Date { order } => Some((Dtype::Date, Reading { comma: false, order, short_year: true })),
+            Kind::DateTime { order } => Some((Dtype::DateTime, Reading { comma: false, order, short_year: true })),
+            Kind::Time => Some((Dtype::Time, PLAIN)),
             Kind::Bool => Some((Dtype::Bool, PLAIN)),
         }
     }
@@ -1001,7 +1109,8 @@ fn duration_text(n: f64, unit: Unit, words: bool) -> String {
 /// file's text, because `s` is Plain, does not fit the type, or the cell does not read.
 pub fn show(v: &str, t: Dtype, r: Reading, s: &Show) -> Option<String> {
     let num = || matches!(t, Dtype::Int | Dtype::Float).then(|| to_number(v, r.comma)).filter(|n| n.is_finite());
-    let date = || (t == Dtype::Date).then(|| to_date(v, r.order)).flatten();
+    let date = || (family(t) == Family::Date).then(|| read_date(v, &r)).flatten();
+    let time = || (t == Dtype::Time).then(|| to_time(v)).flatten();
     match s {
         Show::Plain => None,
         Show::Number { sep, places } => {
@@ -1019,7 +1128,9 @@ pub fn show(v: &str, t: Dtype, r: Reading, s: &Show) -> Option<String> {
             let sign = if n < 0.0 && nonzero(&body) { "-" } else { "" };
             Some(format!("{sign}{symbol}{body}"))
         }
+        Show::Duration { words, .. } if t == Dtype::Time => Some(duration_text(time()? as f64, Unit::Ms, *words)),
         Show::Duration { unit, words } => Some(duration_text(num()?, *unit, *words)),
+        Show::Time(tp) => Some(time_text(time().or_else(date)?, *tp)),
         Show::Date(p) => Some(date_text(date()?, *p)),
         Show::DateTime(p, tp) => {
             let ms = date()?;
@@ -1046,6 +1157,15 @@ impl Doc {
     pub fn found_type(&self, c: usize) -> (Dtype, Reading) {
         let body = &self.sample[(self.header as usize).min(self.sample.len())..];
         infer_column(column(&body[..body.len().min(1000)], c), &Format::default())
+    }
+
+    /// Of the non-empty cells of column `c` in the first 1,000 body rows: how many read as its
+    /// type, how many there are, and whether the body has more rows than that.
+    pub fn sample_reads(&self, c: usize) -> (usize, usize, bool) {
+        let body = &self.sample[(self.header as usize).min(self.sample.len())..];
+        let (t, r) = (self.dtypes.get(c).copied().unwrap_or(Dtype::String), self.reads.get(c).copied().unwrap_or(PLAIN));
+        let cells: Vec<&str> = column(&body[..body.len().min(1000)], c).map(str::trim).filter(|s| !s.is_empty()).collect();
+        (cells.iter().filter(|v| fits(t, &r, v)).count(), cells.len(), body.len() > 1000)
     }
 
     /// Column `c` takes the type of `kind`; Auto finds it again. Cached sort ranks are dropped.
@@ -1168,13 +1288,11 @@ impl Doc {
     }
 }
 
-const PLAIN: Reading = Reading { comma: false, order: Order::Ymd };
+const PLAIN: Reading = Reading { comma: false, order: Order::Ymd, short_year: false };
 /// The rank of empty and unreadable cells.
 const LAST: u32 = u32::MAX;
 /// Records per scan task.
 const CHUNK: usize = 1 << 14;
-/// The span length of an empty text key.
-const NONE: u32 = u32::MAX;
 
 /// A cell as JavaScript's `Number(v)` reads it: trimmed; decimal, 0x, 0o, 0b, or "Infinity"; else NaN.
 fn js_number(v: &str) -> f64 {
@@ -1253,13 +1371,15 @@ pub enum Family {
     String,
     Number,
     Date,
+    Time,
     Bool,
 }
 
 pub fn family(t: Dtype) -> Family {
     match t {
         Dtype::Int | Dtype::Float => Family::Number,
-        Dtype::Date => Family::Date,
+        Dtype::Date | Dtype::DateTime => Family::Date,
+        Dtype::Time => Family::Time,
         Dtype::Bool => Family::Bool,
         Dtype::String => Family::String,
     }
@@ -1269,7 +1389,7 @@ pub fn family(t: Dtype) -> Family {
 pub fn ops(f: Family) -> &'static [(Op, &'static str)] {
     match f {
         Family::String => &[(Op::Contains, "contains"), (Op::Equals, "equals"), (Op::Is, "is exactly"), (Op::Starts, "starts with"), (Op::Empty, "is empty"), (Op::NotEmpty, "not empty")],
-        Family::Number => &[(Op::Eq, "="), (Op::Ne, "≠"), (Op::Gt, ">"), (Op::Ge, "≥"), (Op::Lt, "<"), (Op::Le, "≤"), (Op::Between, "between")],
+        Family::Number | Family::Time => &[(Op::Eq, "="), (Op::Ne, "≠"), (Op::Gt, ">"), (Op::Ge, "≥"), (Op::Lt, "<"), (Op::Le, "≤"), (Op::Between, "between")],
         Family::Date => &[(Op::Lt, "before"), (Op::Gt, "after"), (Op::Between, "between")],
         Family::Bool => &[(Op::True, "is true"), (Op::False, "is false")],
     }
@@ -1310,15 +1430,13 @@ pub fn predicate(f: &Filter, t: Dtype, r: Reading) -> Option<Test> {
         Op::False => return Some(Box::new(|v: &str| v.trim().to_lowercase() == "false")),
         _ => {}
     }
-    let date = t == Dtype::Date;
-    let operand = |s: &str| if date { to_date(s, Order::Ymd).map_or(f64::NAN, |n| n as f64) } else { to_number(s, false) };
-    let (x, y) = (operand(&f.a), operand(&f.b));
+    let (x, y) = (value(t, PLAIN, &f.a), value(t, PLAIN, &f.b));
     if x.is_nan() || (f.op == Op::Between && y.is_nan()) {
         return None;
     }
     let (lo, hi, op) = (x.min(y), x.max(y), f.op);
     Some(Box::new(move |v: &str| {
-        let n = if date { to_date(v, r.order).map_or(f64::NAN, |n| n as f64) } else { to_number(v, r.comma) };
+        let n = value(t, r, v);
         !n.is_nan()
             && match op {
                 Op::Eq => n == x,
@@ -1345,6 +1463,11 @@ pub struct SortKey {
     pub dir: Dir,
 }
 
+/// A number or time cell whose value is 0, as the sort reads it: `0`, `0.00`, `-0`, `0:00:00`.
+pub fn is_zero(t: Dtype, r: Reading, v: &str) -> bool {
+    matches!(t, Dtype::Int | Dtype::Float | Dtype::Time) && sort_number(t, r, v) == Some(0.0)
+}
+
 /// A cell as a sort key for a dtype that is not string, or None when it is empty or does not read as `t`.
 fn sort_number(t: Dtype, r: Reading, v: &str) -> Option<f64> {
     let s = v.trim();
@@ -1353,17 +1476,25 @@ fn sort_number(t: Dtype, r: Reading, v: &str) -> Option<f64> {
     }
     let n = match t {
         Dtype::Bool => return is_bool(s).then(|| if s.eq_ignore_ascii_case("true") { 1.0 } else { 0.0 }),
-        Dtype::Date => to_date(s, r.order).map_or(f64::NAN, |n| n as f64),
-        _ => to_number(s, r.comma),
+        _ => value(t, r, s),
     };
     (!n.is_nan()).then_some(n)
+}
+
+/// A cell of a number, date, or time column as a number (dates and times in ms), or NaN.
+fn value(t: Dtype, r: Reading, s: &str) -> f64 {
+    match t {
+        Dtype::Date | Dtype::DateTime => read_date(s, &r).map_or(f64::NAN, |n| n as f64),
+        Dtype::Time => to_time(s).map_or(f64::NAN, |n| n as f64),
+        _ => to_number(s, r.comma),
+    }
 }
 
 fn trim_zeros(s: &[u8]) -> &[u8] {
     &s[s.iter().take_while(|&&c| c == b'0').count()..]
 }
 
-// ponytail: no accent folding and no ICU punctuation order; add a collation crate if a file needs them.
+// Limit: no accent folding and no ICU punctuation order; add a collation crate if a file needs them.
 /// Text as a key whose byte order is close to `Intl.Collator(undefined, { numeric: true,
 /// sensitivity: "base" })` on lower-cased text: each digit run, without leading zeros, becomes a
 /// length mark in '0'..='9' and then its digits, so a longer number sorts later. Runs of more
@@ -1486,7 +1617,7 @@ pub fn bin_range(span: (f64, f64), i: usize, step: f64) -> (f64, f64) {
     };
     (lo, hi)
 }
-const TOP: usize = 10;
+pub const TOP: usize = 10;
 const MG_K: usize = 1024;
 const HLL_P: u32 = 14;
 
@@ -1661,8 +1792,7 @@ impl Part {
         let chars = s.chars().count();
         self.len = (self.len.0.min(chars), self.len.1 + chars, self.len.2.max(chars));
         let read = match t {
-            Dtype::Int | Dtype::Float => Some(to_number(s, r.comma)).filter(|n| !n.is_nan()),
-            Dtype::Date => to_date(s, r.order).map(|ms| ms as f64),
+            Dtype::Int | Dtype::Float | Dtype::Date | Dtype::DateTime | Dtype::Time => Some(value(t, r, s)).filter(|n| !n.is_nan()),
             Dtype::Bool => is_bool(s).then_some(f64::NAN),
             Dtype::String => Some(f64::NAN),
         };
@@ -1694,6 +1824,95 @@ impl Part {
 pub fn date_label(ms: i64) -> String {
     let date = date_text(ms, DatePat::Iso);
     if ms.rem_euclid(86_400_000) == 0 { date } else { format!("{date} {}", time_text(ms, TimePat::Hms)) }
+}
+
+/// A time in ms as "1:02:03", with ".045" when it has milliseconds. `to_time` reads it back.
+pub fn time_label(ms: i64) -> String {
+    let (s, f) = (ms.div_euclid(1000), ms.rem_euclid(1000));
+    let hms = format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60);
+    if f == 0 { hms } else { format!("{hms}.{f:03}") }
+}
+
+/// A JSON string: in quotes, with `"`, `\`, and control characters escaped.
+pub fn json_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The Profile of columns `cols` as one JSON object, for the command line: the first `limit`
+/// rows (None: all), one column at a time. A key that a type does not have is left out. Dates
+/// and times are text, as the app shows them; other numbers are JSON numbers (NaN as null).
+pub fn profile_json(doc: &Doc, cols: &[usize], limit: Option<usize>, distinct: Distinct) -> String {
+    let Some(scan) = doc.scan() else { return "{}".into() };
+    let stop = AtomicBool::new(false);
+    let num = |x: f64| if x.is_finite() { format!("{x}") } else { "null".into() };
+    let text = |s: String| json_text(&s);
+    let file = doc.path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    let total = scan.rows();
+    let mut out = format!(
+        "{{\"file\": {}, \"rows\": {}, \"total_rows\": {total}, \"distinct\": \"{}\", \"columns\": [",
+        json_text(&file),
+        total.min(limit.unwrap_or(usize::MAX)),
+        if distinct == Distinct::Exact { "exact" } else { "approx" }
+    );
+    for (k, &c) in cols.iter().enumerate() {
+        let p = scan.profile(None, limit, c, distinct, &stop);
+        let ty = doc.dtypes.get(c).copied().unwrap_or(Dtype::String);
+        let mut f: Vec<(&str, String)> = vec![("name", json_text(&doc.names[c])), ("type", json_text(ty.name())), ("count", p.rows.to_string()), ("empty", p.empty.to_string())];
+        if ty != Dtype::String {
+            f.push(("not_readable", p.unreadable.to_string()));
+        }
+        f.extend([("distinct", p.distinct.to_string()), ("approx", p.approx.to_string())]);
+        if let Some(u) = p.unique {
+            f.push(("unique", u.to_string()));
+        }
+        let top: Vec<String> = p.top.iter().map(|(v, n)| format!("{{\"value\": {}, \"count\": {n}}}", json_text(v))).collect();
+        f.push(("top", format!("[{}]", top.join(", "))));
+        match (ty, p.num) {
+            (Dtype::String, _) => {
+                if let Some((lo, hi)) = &p.range {
+                    f.extend([("first", json_text(lo)), ("last", json_text(hi))]);
+                }
+                if let Some((a, m, b)) = p.len {
+                    f.extend([("shortest", a.to_string()), ("longest", b.to_string()), ("mean_length", num(m))]);
+                }
+            }
+            (Dtype::Int | Dtype::Float, Some(s)) => f.extend([("min", num(s.min)), ("max", num(s.max)), ("mean", num(s.mean)), ("median", num(s.median)), ("std", num(s.std)), ("sum", num(s.sum))]),
+            (Dtype::Time, Some(s)) => {
+                let at = |x: f64| text(time_label(x.round() as i64));
+                f.extend([("min", at(s.min)), ("max", at(s.max)), ("mean", at(s.mean)), ("median", at(s.median)), ("std", at(s.std)), ("sum", at(s.sum))]);
+            }
+            (Dtype::Date | Dtype::DateTime, _) => {
+                if let Some((lo, hi)) = p.span {
+                    f.extend([("earliest", text(date_label(lo as i64))), ("latest", text(date_label(hi as i64))), ("span_seconds", num((hi - lo) / 1000.0))]);
+                }
+            }
+            (Dtype::Bool, _) => {
+                let n = |w: &str| p.top.iter().filter(|(v, _)| v.trim().eq_ignore_ascii_case(w)).map(|v| v.1).sum::<usize>();
+                f.extend([("true", n("true").to_string()), ("false", n("false").to_string())]);
+            }
+            _ => {}
+        }
+        if !p.hist.is_empty() {
+            f.push(("histogram", format!("[{}]", p.hist.iter().map(usize::to_string).collect::<Vec<_>>().join(", "))));
+        }
+        let body: Vec<String> = f.into_iter().map(|(key, v)| format!("\"{key}\": {v}")).collect();
+        out += &format!("{}\n  {{{}}}", if k == 0 { "" } else { "," }, body.join(", "));
+    }
+    out + "\n]}"
 }
 
 impl Scan {
@@ -1744,7 +1963,7 @@ impl Scan {
             }
             part
         };
-        let numeric = matches!(t, Dtype::Int | Dtype::Float | Dtype::Date);
+        let numeric = matches!(t, Dtype::Int | Dtype::Float | Dtype::Date | Dtype::DateTime | Dtype::Time);
         let mut nums = if numeric { vec![f64::NAN; n] } else { Vec::new() };
         let parts: Vec<Part> = if numeric {
             nums.par_chunks_mut(CHUNK).enumerate().map(|(k, slot)| work(k * CHUNK, slot)).collect()
@@ -1783,7 +2002,7 @@ impl Scan {
             for &x in v.iter() {
                 out.hist[bin(x, (min, max))] += 1;
             }
-            if matches!(t, Dtype::Int | Dtype::Float) {
+            if matches!(t, Dtype::Int | Dtype::Float | Dtype::Time) {
                 let (len, sum) = (v.len() as f64, v.iter().sum::<f64>());
                 let mean = sum / len;
                 let var = if v.len() > 1 { v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (len - 1.0) } else { 0.0 };
@@ -1881,9 +2100,6 @@ impl Scan {
         out
     }
 }
-
-/// One CHUNK of rows' natural text keys: a byte arena, and a (start, length) span per row.
-type TextKeys = (Vec<u8>, Vec<(u32, u32)>);
 
 /// The parts in order, in one Vec of exact capacity. A collect of a flatten grows by doubling.
 fn concat<T>(parts: Vec<Vec<T>>) -> Vec<T> {
@@ -2074,41 +2290,28 @@ impl Scan {
         concat(parts)
     }
 
-    /// Column `c` as natural text keys (trimmed, lower-cased), one byte arena per chunk of
-    /// CHUNK rows, with a (start, length) span per row. An empty cell has length NONE.
-    fn text_keys(&self, c: usize) -> Vec<TextKeys> {
-        let (d, q) = (&self.d[..], &self.q[..]);
-        self.body()
-            .par_chunks(CHUNK)
-            .map(|chunk| {
-                let (mut arena, mut spans) = (Vec::new(), Vec::with_capacity(chunk.len()));
-                let (mut scratch, mut low) = (Vec::new(), Vec::new());
-                for &s in chunk {
-                    let mut span = (0, NONE);
-                    each_field(&self.data, s as usize, d, q, &mut scratch, &mut |k, x| {
-                        if k == c {
-                            let v = String::from_utf8_lossy(x);
-                            let v = v.trim();
-                            if !v.is_empty() {
-                                let at = arena.len();
-                                if v.is_ascii() {
-                                    low.clear();
-                                    low.extend(v.bytes().map(|b| b.to_ascii_lowercase()));
-                                    natural_key(&low, &mut arena);
-                                } else {
-                                    natural_key(v.to_lowercase().as_bytes(), &mut arena);
-                                }
-                                span = (at as u32, (arena.len() - at) as u32);
-                            }
-                        }
-                        k < c
-                    });
-                    spans.push(span);
+    /// Data row `i`'s natural text key in column `c` (trimmed, lower-cased), added to `out`.
+    /// False for an empty cell.
+    fn cell_key(&self, i: usize, c: usize, scratch: &mut Vec<u8>, low: &mut Vec<u8>, out: &mut Vec<u8>) -> bool {
+        let mut found = false;
+        each_field(&self.data, self.body()[i] as usize, &self.d, &self.q, scratch, &mut |k, x| {
+            if k == c {
+                let v = String::from_utf8_lossy(x);
+                let v = v.trim();
+                if !v.is_empty() {
+                    found = true;
+                    if v.is_ascii() {
+                        low.clear();
+                        low.extend(v.bytes().map(|b| b.to_ascii_lowercase()));
+                        natural_key(low, out);
+                    } else {
+                        natural_key(v.to_lowercase().as_bytes(), out);
+                    }
                 }
-                arena.shrink_to_fit();
-                (arena, spans)
-            })
-            .collect()
+            }
+            k < c
+        });
+        found
     }
 
     /// The sort rank of every data row in column `c`, cached. Text compares with digit runs as
@@ -2119,23 +2322,76 @@ impl Scan {
         }
         let (t, r, n) = (self.dtype(c), self.read(c), self.rows());
         let out = if t == Dtype::String {
-            let parts = self.text_keys(c);
-            let key = |i: u32| {
-                let (at, len) = parts[i as usize / CHUNK].1[i as usize % CHUNK];
-                &parts[i as usize / CHUNK].0[at as usize..at as usize + len as usize]
-            };
-            // Built in order with an exact capacity: a parallel collect holds the pairs twice.
-            let count = parts.iter().map(|p| p.1.iter().filter(|s| s.1 != NONE).count()).sum();
-            let mut pairs: Vec<([u8; 16], u32)> = Vec::with_capacity(count);
-            for (ch, (arena, spans)) in parts.iter().enumerate() {
-                for (j, &(at, len)) in spans.iter().enumerate().filter(|s| s.1.1 != NONE) {
-                    let k = &arena[at as usize..at as usize + len as usize];
-                    let (mut p, m) = ([0; 16], k.len().min(16));
-                    p[..m].copy_from_slice(&k[..m]);
-                    pairs.push((p, (ch * CHUNK + j) as u32));
+            // (15-byte key prefix, length mark, row): the mark is the key's length, or 16 when it
+            // is longer than 15 bytes. With the zero padding, (prefix, mark) orders as the keys
+            // do, except two keys longer than 15 bytes with one prefix. Only those runs make
+            // their keys again from the file, so no key is held for every row.
+            let mut pairs: Vec<([u8; 16], u32)> = vec![([0; 16], u32::MAX); n];
+            pairs.par_chunks_mut(CHUNK).enumerate().for_each(|(ch, part)| {
+                let (mut scratch, mut low, mut key) = (Vec::new(), Vec::new(), Vec::new());
+                for (j, slot) in part.iter_mut().enumerate() {
+                    let i = ch * CHUNK + j;
+                    key.clear();
+                    if self.cell_key(i, c, &mut scratch, &mut low, &mut key) {
+                        let m = key.len().min(15);
+                        slot.0[..m].copy_from_slice(&key[..m]);
+                        slot.0[15] = key.len().min(16) as u8;
+                        slot.1 = i as u32;
+                    }
+                }
+            });
+            pairs.retain(|p| p.1 != u32::MAX); // the empty cells: they rank LAST
+            pairs.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let mut runs = Vec::new();
+            let mut a = 0;
+            while a < pairs.len() {
+                let b = a + pairs[a..].iter().take_while(|p| p.0 == pairs[a].0).count();
+                if b - a > 1 && pairs[a].0[15] == 16 {
+                    runs.push((a, b));
+                }
+                a = b;
+            }
+            // Each run in key order, and where a new key starts in it.
+            let resolved: Vec<(Vec<u32>, Vec<bool>)> = runs
+                .par_iter()
+                .map(|&(a, b)| {
+                    let (mut scratch, mut low, mut arena, mut spans) = (Vec::new(), Vec::new(), Vec::new(), Vec::with_capacity(b - a));
+                    for p in &pairs[a..b] {
+                        let at = arena.len();
+                        self.cell_key(p.1 as usize, c, &mut scratch, &mut low, &mut arena);
+                        spans.push((at, arena.len()));
+                    }
+                    let key = |m: usize| &arena[spans[m].0..spans[m].1];
+                    let mut order: Vec<usize> = (0..b - a).collect();
+                    order.sort_by(|&x, &y| key(x).cmp(key(y)));
+                    let starts = (0..order.len()).map(|k| k == 0 || key(order[k - 1]) != key(order[k])).collect();
+                    (order.iter().map(|&m| pairs[a + m].1).collect(), starts)
+                })
+                .collect();
+            for (&(a, _), (rows, _)) in runs.iter().zip(&resolved) {
+                for (m, &row) in rows.iter().enumerate() {
+                    pairs[a + m].1 = row;
                 }
             }
-            ranks_of(n, &mut pairs, |a, b| a.0.cmp(&b.0).then_with(|| key(a.1).cmp(key(b.1))))
+            let mut out = vec![LAST; n];
+            let (mut k, mut run) = (0, 0);
+            for j in 0..pairs.len() {
+                let same = match runs.get(run) {
+                    Some(&(a, b)) if (a..b).contains(&j) => {
+                        let same = !resolved[run].1[j - a];
+                        if j + 1 == b {
+                            run += 1;
+                        }
+                        same
+                    }
+                    _ => j > 0 && pairs[j - 1].0 == pairs[j].0,
+                };
+                if j > 0 && !same {
+                    k += 1;
+                }
+                out[pairs[j].1 as usize] = k;
+            }
+            out
         } else {
             let keys = self.map_column(c, |v| sort_number(t, r, v).unwrap_or(f64::NAN));
             let mut pairs: Vec<(f64, u32)> = Vec::with_capacity(keys.iter().filter(|x| !x.is_nan()).count());
@@ -2270,7 +2526,128 @@ mod tests {
     #[test]
     fn dtype_bool_and_date() {
         assert_eq!(infer(&["true", "False", "TRUE"], &F), Dtype::Bool);
-        assert_eq!(infer(&["2024-01-05", "2024/2/9", "2024-03-01T10:00:00Z"], &F), Dtype::Date);
+        assert_eq!(infer(&["2024-01-05", "2024/2/9", "2024-03-01T10:00:00Z"], &F), Dtype::DateTime);
+    }
+    #[test]
+    fn date_with_a_space_before_the_zone() {
+        let v = "2026-01-12 04:40:00.587 +0700";
+        assert!(to_date(v, Order::Ymd).is_some());
+        assert_eq!(to_date(v, Order::Ymd), to_date("2026-01-12 04:40:00", Order::Ymd));
+        assert_eq!(infer(&[v, "2026-01-12 20:10:57.105 -0130", "2026-01-13 09:45:01 Z"], &F), Dtype::DateTime);
+        assert_eq!(to_date("2026-01-12 04:40  +0700", Order::Ymd), None);
+        assert_eq!(to_date("2026-01-12 04:40 x", Order::Ymd), None);
+    }
+    #[test]
+    fn date_with_an_hour_only_zone() {
+        let v = "2023-05-05 09:05:48+00";
+        assert_eq!(to_date(v, Order::Ymd), to_date("2023-05-05 09:05:48", Order::Ymd));
+        assert!(to_date(v, Order::Ymd).is_some());
+        assert_eq!(infer(&[v, "2023-05-06 05:52:37-03", "2023-05-07 12:04:33 +05"], &F), Dtype::DateTime);
+        for bad in ["2023-05-05 09:05:48+0", "2023-05-05 09:05:48+000", "2023-05-05 09:05:48+15", "2023-05-05 09:05:48+05:60"] {
+            assert_eq!(to_date(bad, Order::Ymd), None, "{bad}");
+        }
+    }
+    #[test]
+    fn date_with_a_month_name() {
+        let day = to_date("2024-02-05", Order::Ymd);
+        for v in ["5 Feb 2024", "05 feb 2024", "Feb 5, 2024", "Feb 5 2024", "February 5, 2024", "5 FEBRUARY 2024"] {
+            assert_eq!(to_date(v, Order::Ymd), day, "{v}");
+            assert_eq!(to_date(v, Order::Dmy), day, "{v}");
+        }
+        assert_eq!(to_date("Feb 5, 2024 2:05 PM", Order::Mdy), to_date("2024-02-05 14:05", Order::Ymd));
+        assert_eq!(to_date("5 Feb 2024 14:05:09", Order::Ymd), to_date("2024-02-05 14:05:09", Order::Ymd));
+        for bad in ["5 Fbr 2024", "Feb 32, 2024", "Feb 5, 24", "Feb 5,2024", "123 Feb 2024", "Feb", "5 Feb"] {
+            assert_eq!(to_date(bad, Order::Ymd), None, "{bad}");
+        }
+        assert_eq!(infer(&["5 Feb 2024", "Feb 6, 2024"], &F), Dtype::Date);
+        assert_eq!(infer(&["5 Feb 2024 2:05 PM", "6 Feb 2024 9:00 AM"], &F), Dtype::DateTime);
+    }
+    #[test]
+    fn compact_iso_date() {
+        assert_eq!(to_date("20230505T090548Z", Order::Ymd), to_date("2023-05-05 09:05:48", Order::Ymd));
+        assert_eq!(to_date("20230505T0905", Order::Ymd), to_date("2023-05-05 09:05", Order::Ymd));
+        assert_eq!(to_date("20230505t090548.25+0700", Order::Ymd), to_date("2023-05-05 09:05:48", Order::Ymd));
+        for bad in ["20230505T09054", "20230505T", "20230505 090548", "20231305T0905", "20230505T0960"] {
+            assert_eq!(to_date(bad, Order::Ymd), None, "{bad}");
+        }
+        assert_eq!(to_date("20230505T090548Z", Order::Dmy), None);
+        // No ':' in it, and still a date & time.
+        assert_eq!(infer(&["20230505T090548Z", "20230506T101500Z"], &F), Dtype::DateTime);
+        assert_eq!(infer(&["20230505", "20230506"], &F), Dtype::Int);
+    }
+    #[test]
+    fn twelve_hour_time() {
+        assert_eq!(to_time("2:05 PM"), to_time("14:05"));
+        assert_eq!(to_time("2:05:09pm"), to_time("14:05:09"));
+        assert_eq!(to_time("12:00 AM"), to_time("0:00"));
+        assert_eq!(to_time("12:30 pm"), to_time("12:30"));
+        assert_eq!(to_time("11:59:59.5 AM"), to_time("11:59:59.5"));
+        for bad in ["13:05 PM", "0:05 AM", "100:00 PM", "2:05 XM", "2:05  PM"] {
+            assert_eq!(to_time(bad), None, "{bad}");
+        }
+        assert_eq!(infer(&["2:05 PM", "11:59 AM"], &F), Dtype::Time);
+        assert_eq!(to_date("2024-02-05 2:05 PM", Order::Ymd), to_date("2024-02-05 14:05", Order::Ymd));
+        assert_eq!(to_date("2/5/2024, 2:05:00 PM", Order::Mdy), to_date("2024-02-05 14:05", Order::Ymd));
+        // The app's own 12-hour format reads back.
+        let shown = fmt("2024-02-05 14:05", Dtype::DateTime, PLAIN, Show::DateTime(DatePat::Long, TimePat::H12)).unwrap();
+        assert_eq!(to_date(&shown, Order::Ymd), to_date("2024-02-05 14:05", Order::Ymd));
+    }
+    #[test]
+    fn time_with_a_zone() {
+        for v in ["09:05:48+00", "09:05:48Z", "09:05:48 +0700", "09:05:48+05:30", "9:05:48 AM -03"] {
+            assert_eq!(to_time(v), to_time("09:05:48"), "{v}");
+        }
+        assert_eq!(to_time("09:00-17:00"), None);
+        assert_eq!(infer(&["09:05:48+00", "10:00:00+00"], &F), Dtype::Time);
+    }
+    #[test]
+    fn two_digit_year_only_by_hand() {
+        // Auto never reads one: a version number would be a date.
+        assert_eq!(infer(&["01/02/03", "04/05/06"], &F), Dtype::String);
+        assert_eq!(infer(&["1.2.10", "2.0.11"], &F), Dtype::String);
+        assert_eq!(to_date("01/02/03", Order::Dmy), None);
+        let by_hand = |order| Kind::Date { order }.typed().unwrap().1;
+        for (order, same) in [(Order::Dmy, "2003-02-01"), (Order::Mdy, "2003-01-02"), (Order::Ymd, "2001-02-03")] {
+            let r = by_hand(order);
+            assert!(r.short_year && fits(Dtype::Date, &r, "01/02/03"));
+            assert_eq!(read_date("01/02/03", &r), to_date(same, Order::Ymd), "{order:?}");
+        }
+        let r = by_hand(Order::Dmy);
+        assert_eq!(read_date("01/01/68", &r), to_date("2068-01-01", Order::Ymd));
+        assert_eq!(read_date("01/01/69", &r), to_date("1969-01-01", Order::Ymd));
+        assert_eq!(read_date("31/12/99 23:59", &r), to_date("1999-12-31 23:59", Order::Ymd));
+        assert_eq!(read_date("01/02/2003", &r), to_date("2003-02-01", Order::Ymd));
+        for bad in ["01/02/003", "01/02/3", "001/02/03"] {
+            assert_eq!(read_date(bad, &r), None, "{bad}");
+        }
+    }
+    #[test]
+    fn dtype_time_and_datetime() {
+        assert_eq!(infer(&["00:02:05.881533", "01:27:36.5", "14:05"], &F), Dtype::Time);
+        assert_eq!(infer(&["2024-01-05 10:00", "2024-01-06"], &F), Dtype::DateTime);
+        assert_eq!(infer(&["2024-01-05", "2024-01-06"], &F), Dtype::Date);
+        assert_eq!(to_time("00:02:05.881533"), Some(125_881));
+        assert_eq!(to_time("14:05"), Some(50_700_000));
+        assert_eq!(to_time("100:00:00"), Some(360_000_000));
+        assert_eq!(to_time(" 1:02:03.4 "), Some(3_723_400));
+        for bad in ["1:2", "1:60", "1:02:60", "1:02.5", "1:02:03.", ":02", "1:02:03:04", "12"] {
+            assert_eq!(to_time(bad), None, "{bad}");
+        }
+    }
+    #[test]
+    fn time_sorts_filters_and_shows() {
+        let v = "00:02:05.881533";
+        assert_eq!(fmt(v, Dtype::Time, PLAIN, Show::Duration { unit: Unit::S, words: true }).unwrap(), "2m 6s");
+        assert_eq!(fmt(v, Dtype::Time, PLAIN, Show::Duration { unit: Unit::Ms, words: false }).unwrap(), "0:02:06");
+        assert_eq!(fmt("14:05:09", Dtype::Time, PLAIN, Show::Time(TimePat::H12)).unwrap(), "2:05 PM");
+        assert_eq!(fmt("x", Dtype::Time, PLAIN, Show::Time(TimePat::Hm)), None);
+        assert_eq!(fmt("2024-02-05 14:05:09", Dtype::DateTime, PLAIN, Show::Time(TimePat::Hms)).unwrap(), "14:05:09");
+        assert_eq!(fmt("2024-02-05 14:05:09", Dtype::DateTime, PLAIN, Show::Date(DatePat::Long)).unwrap(), "5 Feb 2024");
+        assert_eq!(sorted(&one_col(Dtype::Time, &["1:00:00", "x", "0:02:05.9", v]), 0), [vec![3, 2, 0, 1], vec![0, 2, 3, 1]]);
+        assert_eq!(pick(&["0:01:12", "0:15:00", "1:27:36"], Dtype::Time, Op::Gt, "0:10:00", "", PLAIN), ["0:15:00", "1:27:36"]);
+        assert_eq!(pick(&["2024-01-05 10:00", "2024-02-05 09:00"], Dtype::DateTime, Op::Lt, "2024-02-01", "", PLAIN), ["2024-01-05 10:00"]);
+        assert_eq!((time_label(125_881), time_label(3_600_000)), ("0:02:05.881".into(), "1:00:00".into()));
+        assert_eq!(to_time(&time_label(125_881)), Some(125_881));
     }
     #[test]
     fn dtype_95_percent_threshold_empties_ignored_1000_value_cap() {
@@ -2303,14 +2680,14 @@ mod tests {
     #[test]
     fn format_date_order_mdy_auto() {
         let (t, r) = infer_column(["12/25/2024", "01/05/2024 08:30"], &F);
-        assert_eq!((t, r.order), (Dtype::Date, Order::Mdy));
+        assert_eq!((t, r.order), (Dtype::DateTime, Order::Mdy));
         assert_eq!(to_date("12/25/2024", Order::Mdy), Some(1_735_084_800_000));
         assert_eq!(to_date("12/25/2024", Order::Dmy), None);
         assert_eq!(infer(&["12/25/2024"], &Format { order: Some(Order::Dmy), ..F }), Dtype::String);
     }
     #[test]
     fn format_dot_date_delimiter() {
-        assert_eq!(infer(&["05.01.2024", "31.12.2023 08:30"], &F), Dtype::Date);
+        assert_eq!(infer(&["05.01.2024", "31.12.2023 08:30"], &F), Dtype::DateTime);
         assert_eq!(to_date("31.12.2023", Order::Dmy), Some(1_703_980_800_000));
         assert_eq!(to_date("2024.01.05", Order::Ymd), Some(1_704_412_800_000));
         assert_eq!(to_date("2024.01-05", Order::Ymd), None);
@@ -2596,6 +2973,14 @@ mod tests {
         assert_eq!(values(&t, 0, &desc), ["item 10", "Item 2", "item 1", "banana", "Apple"]);
     }
     #[test]
+    fn sort_text_compares_whole_keys_past_the_15_byte_prefix() {
+        let a15 = "a".repeat(15);
+        let v = [format!("{a15}X2"), format!("{a15}a"), "ab\u{0}".to_string(), format!("{a15}X1"), String::new(), a15.clone(), "ab".to_string(), format!("{}X1", "A".repeat(15)), format!("{a15}b")];
+        let t = one_col(Dtype::String, &v.iter().map(String::as_str).collect::<Vec<_>>());
+        // Equal keys (rows 3 and 7, case aside) keep the file order in both directions; empty is last.
+        assert_eq!(sorted(&t, 0), [vec![5, 1, 8, 3, 7, 0, 6, 2, 4], vec![2, 6, 0, 3, 7, 8, 1, 5, 4]]);
+    }
+    #[test]
     fn sort_empty_and_unreadable_cells_last_in_both_directions() {
         assert_eq!(sorted(&one_col(Dtype::Int, &["3", "", "x", "1", "2"]), 0), [vec![3, 4, 0, 1, 2], vec![0, 4, 3, 1, 2]]);
         assert_eq!(sorted(&one_col(Dtype::String, &["b", " ", "a"]), 0), [vec![2, 0, 1], vec![0, 2, 1]]);
@@ -2785,8 +3170,8 @@ mod tests {
     fn fmt(v: &str, t: Dtype, r: Reading, s: Show) -> Option<String> {
         show(v, t, r, &s)
     }
-    const DMY: Reading = Reading { comma: false, order: Order::Dmy };
-    const COMMA: Reading = Reading { comma: true, order: Order::Ymd };
+    const DMY: Reading = Reading { comma: false, order: Order::Dmy, short_year: false };
+    const COMMA: Reading = Reading { comma: true, order: Order::Ymd, short_year: false };
     #[test]
     fn show_number_thousands_and_places() {
         let n = |places| Show::Number { sep: true, places };
@@ -2871,11 +3256,65 @@ mod tests {
         t.set_kind(0, Kind::Auto);
         assert_eq!((t.dtypes[0], t.reads[0].order), (Dtype::Date, Order::Dmy));
         assert_eq!(t.found_type(0).0, Dtype::Date);
+        assert_eq!(t.sample_reads(0), (3, 3, false));
+        t.set_kind(0, Kind::Date { order: Order::Ymd });
+        assert_eq!(t.sample_reads(0), (0, 3, false));
+        t.set_kind(0, Kind::Time);
+        assert_eq!(t.sample_reads(0), (0, 3, false));
+    }
+    #[test]
+    fn two_digit_years_read_after_a_type_set_by_hand() {
+        let mut t = table("d\n01/02/03\n15/06/99\n31/12/68", ",");
+        let asc = |t: &Doc| t.scan().unwrap().sort(&all(t), &[k(0, Dir::Asc)]);
+        assert_eq!(t.dtypes[0], Dtype::String);
+        t.set_kind(0, Kind::Date { order: Order::Dmy });
+        assert_eq!(t.sample_reads(0), (3, 3, false));
+        // 15 Jun 1999, 1 Feb 2003, 31 Dec 2068
+        assert_eq!(asc(&t), [1, 0, 2]);
+        assert_eq!(fmt("15/06/99", Dtype::Date, t.reads[0], Show::Date(DatePat::Iso)).unwrap(), "1999-06-15");
+        t.set_kind(0, Kind::Date { order: Order::Ymd });
+        assert_eq!(t.sample_reads(0), (1, 3, false));
+        t.set_kind(0, Kind::Auto);
+        assert_eq!(t.dtypes[0], Dtype::String);
     }
 
     // 0.8.0: data profiling
     fn prof(t: &Doc, rows: Option<&[u32]>, limit: Option<usize>, c: usize, d: Distinct) -> Profile {
         t.scan().unwrap().profile(rows, limit, c, d, &AtomicBool::new(false))
+    }
+    #[test]
+    fn zero_reads_as_the_sort_reads_it() {
+        let comma = Reading { comma: true, ..PLAIN };
+        let zero = |t, r, v| is_zero(t, r, v);
+        assert!(zero(Dtype::Int, PLAIN, "0") && zero(Dtype::Int, PLAIN, "-0") && zero(Dtype::Float, PLAIN, "0.00") && zero(Dtype::Float, comma, "0,00"));
+        assert!(zero(Dtype::Time, PLAIN, "0:00:00") && zero(Dtype::Time, PLAIN, "0:00"));
+        assert!(!zero(Dtype::Float, PLAIN, "0.01") && !zero(Dtype::Time, PLAIN, "0:00:01") && !zero(Dtype::Int, PLAIN, "") && !zero(Dtype::Int, PLAIN, "x"));
+        assert!(!zero(Dtype::String, PLAIN, "0") && !zero(Dtype::Bool, PLAIN, "false") && !zero(Dtype::Date, PLAIN, "1970-01-01"));
+    }
+    #[test]
+    fn json_text_escapes_quotes_backslashes_and_controls() {
+        assert_eq!(json_text("a\"b\\c\nd\te\u{1}é"), "\"a\\\"b\\\\c\\nd\\te\\u0001é\"");
+        assert_eq!(json_text(""), "\"\"");
+    }
+    #[test]
+    fn profile_json_keeps_each_type_s_own_keys() {
+        let rows: [&[&str]; 4] = [&["Oslo", "1", "2024-01-31", "true"], &["Lima", "2", "2024-02-01", "false"], &["Oslo", "", "x", "true"], &["Oslo \"x\"", "4", "2024-03-01", ""]];
+        let doc = typed(&[Dtype::String, Dtype::Int, Dtype::Date, Dtype::Bool], &rows);
+        let j = profile_json(&doc, &[0, 1, 2, 3], None, Distinct::Exact);
+        let cols: Vec<&str> = j.split("\n  {").skip(1).collect();
+        assert!(j.starts_with("{\"file\": \"t\", \"rows\": 4, \"total_rows\": 4, \"distinct\": \"exact\", \"columns\": [") && j.ends_with("}\n]}"), "{j}");
+        assert_eq!(cols.len(), 4);
+        assert!(
+            cols[0].contains("\"type\": \"string\"")
+                && cols[0].contains("{\"value\": \"Oslo\", \"count\": 2}")
+                && cols[0].contains("\"Oslo \\\"x\\\"\"")
+                && !cols[0].contains("not_readable")
+                && !cols[0].contains("\"min\"")
+        );
+        assert!(cols[1].contains("\"empty\": 1") && cols[1].contains("\"min\": 1, \"max\": 4") && cols[1].contains("\"sum\": 7") && cols[1].contains("\"histogram\": ["));
+        assert!(cols[2].contains("\"not_readable\": 1") && cols[2].contains("\"earliest\": \"2024-01-31\"") && cols[2].contains("\"latest\": \"2024-03-01\""));
+        assert!(cols[3].contains("\"true\": 2, \"false\": 1") && cols[3].contains("\"empty\": 1"));
+        assert_eq!(profile_json(&doc, &[1], Some(2), Distinct::Approx).split(", \"columns\"").next(), Some("{\"file\": \"t\", \"rows\": 2, \"total_rows\": 4, \"distinct\": \"approx\""));
     }
     #[test]
     fn profile_counts_and_number_statistics() {

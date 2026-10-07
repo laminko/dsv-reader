@@ -9,6 +9,7 @@
 //! DSV_VIEWER=0 starts with the Record viewer closed; DSV_HOLD=1 keeps the window open after the bench report.
 //! DSV_OPEN=parse|scope|columns|font|save opens that popover or the Save dialog, for screenshots.
 //! DSV_PROFILE=1000|all|auto opens the Profile and waits for it; DSV_DISTINCT=exact|approx sets its choice.
+//! It profiles every column; DSV_CARDS=screen profiles only the cards on screen, as the app does.
 //! DSV_TOP=column then filters on that column's most common Profile value, as a click on it does;
 //! DSV_TOP=4,8 adds one for each column, joined by and; DSV_TOP=4|8 joins them by or; 9:3 is bar 3
 //! of column 9's histogram.
@@ -28,6 +29,7 @@ use dsv_reader as dsv;
 
 use dsv::{Dir, Doc, Filter, Kind, Opts, Sel, Show, SortKey, floor_index, predicate, to_tsv};
 use file::{Done, Settings, Stamp, Theme, enc_name, eol_text, save, stamp, write_file};
+use gpui_kit::base::TextSelection;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, ThemeMode};
 use gpui_kit::*;
@@ -144,8 +146,9 @@ pub struct Reader {
     pub panes: Vec<Pane>,
     pub tab: Tab,
     pub prof: pane::Prof,
-    /// The pane's edge is being dragged: the mouse and the pane size at the press.
-    pub pane_drag: Option<(f32, f32)>,
+    /// A pane group's edge is being dragged: below the grid or not, the mouse, and the size at
+    /// the press.
+    pub pane_drag: Option<(bool, f32, f32)>,
     /// The line between the two panes is being dragged: the mouse and the split at the press.
     pub split_drag: Option<(f32, f32)>,
     /// The side pane's height in the last frame.
@@ -297,7 +300,7 @@ impl Reader {
         self.stop_job();
         (self.scope, self.sort, self.filters, self.filter_rows, self.scan_ms, self.note) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), None, None);
         self.prof.stop();
-        (self.prof.dirty, self.prof.distinct, self.prof.cols, self.prof.out, self.prof.counts) = (true, None, None, Default::default(), Default::default());
+        (self.prof.dirty, self.prof.distinct, self.prof.cols, self.prof.work) = (true, None, None, Default::default());
         self.dirty = true;
         let t = Instant::now();
         match Doc::open(&path, &self.opts, || {}) {
@@ -481,6 +484,12 @@ impl Reader {
         cx.notify();
     }
 
+    pub fn set_zebra(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.zebra = on;
+        self.settings.save();
+        cx.notify();
+    }
+
     pub fn set_theme(&mut self, theme: Theme, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.theme = theme;
         self.settings.save();
@@ -535,7 +544,7 @@ impl Reader {
         self.note = Some(match self.copy_text(names) {
             Ok((text, rows)) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
-                format!("Copied {} rows", sep(rows))
+                format!("Copied {}", count(rows, "row"))
             }
             Err(e) => e,
         });
@@ -588,7 +597,9 @@ impl Reader {
         cx.notify();
     }
 
-    fn step(&mut self, dr: isize, dc: isize, extend: bool, cx: &mut Context<Self>) {
+    /// A key moves the active cell. Text dragged in the Viewer is cleared: ⌘C then copies the new cell.
+    fn step(&mut self, dr: isize, dc: isize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        TextSelection::clear(window, cx);
         if let Some(g) = &mut self.grid {
             let dr = if dr.abs() == 2 { dr.signum() * g.page() } else { dr };
             g.step(dr, dc, extend);
@@ -600,6 +611,8 @@ impl Reader {
     fn grid_view(&mut self, t: Tokens, cx: &mut Context<Self>) -> AnyElement {
         let menu = self.column_menu(t, cx);
         let (sort, drew) = (self.sort.clone(), self.drew.clone());
+        // Zebra rows off: their fill is the background, and the paint skips it.
+        let t = if self.settings.zebra { t } else { Tokens { zebra: t.bg, ..t } };
         let Some(g) = &mut self.grid else { return div().into_any_element() };
         let canvas = g.canvas(t, &sort, drew);
         let cursor = match (g.on_edge, g.drag) {
@@ -658,26 +671,37 @@ impl Reader {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(up))
-            .on_action(cx.listener(|r, _: &MoveUp, _, cx| r.step(-1, 0, false, cx)))
-            .on_action(cx.listener(|r, _: &MoveDown, _, cx| r.step(1, 0, false, cx)))
-            .on_action(cx.listener(|r, _: &MoveLeft, _, cx| r.step(0, -1, false, cx)))
-            .on_action(cx.listener(|r, _: &MoveRight, _, cx| r.step(0, 1, false, cx)))
-            .on_action(cx.listener(|r, _: &ExtendUp, _, cx| r.step(-1, 0, true, cx)))
-            .on_action(cx.listener(|r, _: &ExtendDown, _, cx| r.step(1, 0, true, cx)))
-            .on_action(cx.listener(|r, _: &ExtendLeft, _, cx| r.step(0, -1, true, cx)))
-            .on_action(cx.listener(|r, _: &ExtendRight, _, cx| r.step(0, 1, true, cx)))
-            .on_action(cx.listener(|r, _: &GridPageUp, _, cx| r.step(-2, 0, false, cx)))
-            .on_action(cx.listener(|r, _: &GridPageDown, _, cx| r.step(2, 0, false, cx)))
-            .on_action(cx.listener(|r, _: &ExtendPageUp, _, cx| r.step(-2, 0, true, cx)))
-            .on_action(cx.listener(|r, _: &ExtendPageDown, _, cx| r.step(2, 0, true, cx)))
-            .on_action(cx.listener(|r, _: &SelectAll, _, cx| {
+            .on_action(cx.listener(|r, _: &MoveUp, window, cx| r.step(-1, 0, false, window, cx)))
+            .on_action(cx.listener(|r, _: &MoveDown, window, cx| r.step(1, 0, false, window, cx)))
+            .on_action(cx.listener(|r, _: &MoveLeft, window, cx| r.step(0, -1, false, window, cx)))
+            .on_action(cx.listener(|r, _: &MoveRight, window, cx| r.step(0, 1, false, window, cx)))
+            .on_action(cx.listener(|r, _: &ExtendUp, window, cx| r.step(-1, 0, true, window, cx)))
+            .on_action(cx.listener(|r, _: &ExtendDown, window, cx| r.step(1, 0, true, window, cx)))
+            .on_action(cx.listener(|r, _: &ExtendLeft, window, cx| r.step(0, -1, true, window, cx)))
+            .on_action(cx.listener(|r, _: &ExtendRight, window, cx| r.step(0, 1, true, window, cx)))
+            .on_action(cx.listener(|r, _: &GridPageUp, window, cx| r.step(-2, 0, false, window, cx)))
+            .on_action(cx.listener(|r, _: &GridPageDown, window, cx| r.step(2, 0, false, window, cx)))
+            .on_action(cx.listener(|r, _: &ExtendPageUp, window, cx| r.step(-2, 0, true, window, cx)))
+            .on_action(cx.listener(|r, _: &ExtendPageDown, window, cx| r.step(2, 0, true, window, cx)))
+            .on_action(cx.listener(|r, _: &SelectAll, window, cx| {
+                TextSelection::clear(window, cx);
                 if let Some(g) = &mut r.grid {
                     g.select_all();
                 }
                 cx.notify();
             }))
-            .on_action(cx.listener(|r, _: &CopyCells, _, cx| r.copy(false, cx)))
-            .on_action(cx.listener(|r, _: &ClearSelection, _, cx| {
+            // Text dragged in the Viewer copies as text: a field press gives the grid the focus, so ⌘C comes here.
+            .on_action(cx.listener(|r, _: &CopyCells, window, cx| {
+                if !TextSelection::has_selection(window, cx) {
+                    return r.copy(false, cx);
+                }
+                let text = TextSelection::selected_text(window, cx);
+                r.note = Some(format!("Copied {}", count(text.chars().count(), "character")));
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|r, _: &ClearSelection, window, cx| {
+                TextSelection::clear(window, cx);
                 if let Some(g) = &mut r.grid {
                     (g.sel, g.menu) = (None, None);
                 }
@@ -715,7 +739,7 @@ impl Reader {
             this.update(cx, |r, cx| {
                 r.spawn_write(cx, move || {
                     write_file(&path, &scan, view.as_deref().map(Vec::as_slice), &cols, (",", "\n", "\""))
-                        .map(|_| (format!("Exported {} rows to {}", sep(rows), path.display()), None))
+                        .map(|_| (format!("Exported {} to {}", count(rows, "row"), path.display()), None))
                         .map_err(|e| format!("Export failed: {e}"))
                 })
             })
@@ -773,11 +797,11 @@ impl Reader {
         let total = doc.rows();
         let rows = if !done {
             let at = doc.index.starts.lock().unwrap().last().copied().unwrap_or(0);
-            format!("{} rows, indexing {:.0}%", sep(total), at as f64 * 100.0 / doc.data.len().max(1) as f64)
+            format!("{}, indexing {:.0}%", count(total, "row"), at as f64 * 100.0 / doc.data.len().max(1) as f64)
         } else {
             match &g.view {
-                Some(v) if v.len() != total => format!("{} of {} rows", sep(v.len()), sep(total)),
-                _ => format!("{} rows", sep(total)),
+                Some(v) if v.len() != total => format!("{} of {}", sep(v.len()), count(total, "row")),
+                _ => count(total, "row"),
             }
         };
         let mut parts = vec![
@@ -792,7 +816,7 @@ impl Reader {
             parts.push(format!("indexed in {} ms", doc.index.ms.load(Ordering::Relaxed)));
             let bad = doc.index.bad.load(Ordering::Relaxed);
             if bad > 0 {
-                parts.push(format!("{} characters could not be read: try another encoding", sep(bad)));
+                parts.push(format!("{} could not be read: try another encoding", count(bad, "character")));
             }
         }
         if self.job.is_some() {
@@ -911,6 +935,7 @@ impl Reader {
                 "1000" => Some(false),
                 _ => None,
             };
+            self.prof.every = std::env::var("DSV_CARDS").as_deref() != Ok("screen");
             self.prof.distinct = match std::env::var("DSV_DISTINCT").as_deref() {
                 Ok("exact") => Some(dsv::Distinct::Exact),
                 Ok("approx") => Some(dsv::Distinct::Approx),
@@ -958,8 +983,14 @@ impl Reader {
         let goto = self.bench_goto.map_or(String::new(), |ms| format!(" · go to row {ms:.2} ms, top {:.0}, mark {:?}", g.top.get(), g.mark));
         let copy = self.bench_copy.map_or(String::new(), |(ms, bytes)| format!(" · copy {ms:.1} ms, {bytes} bytes"))
             + &self.prof.done_ms().filter(|_| self.bench_profiled).map_or(String::new(), |ms| {
-                let first = self.prof.first_ms.lock().unwrap().unwrap_or(f64::NAN);
-                format!(" · profile {ms:.0} ms, first card {first:.0} ms, {} columns, {} rows, longest frame gap {:.1} ms", self.prof.ncols, self.prof.rows, self.prof_gap)
+                let (first, (done, ..)) = (self.prof.first_ms().unwrap_or(f64::NAN), self.prof.progress());
+                format!(
+                    " · profile {ms:.0} ms, first card {first:.0} ms, {done} of {} columns, {} cards on screen, {} rows, longest frame gap {:.1} ms",
+                    self.prof.order.len(),
+                    self.prof.visible,
+                    self.prof.rows,
+                    self.prof_gap
+                )
             });
         let name = g.doc.path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
         let top = self.bench_top.as_ref().map_or(String::new(), |v| format!(" · top value {v:?}: filters {:?}", self.filters));
@@ -986,11 +1017,12 @@ fn new_instance(path: &Path) -> std::io::Result<()> {
 
 /// The design's colors on gpui-component's theme, light or dark, and IBM Plex Sans.
 fn apply_theme(theme: Theme, window: &mut Window, cx: &mut App) {
-    let dark = match theme {
-        Theme::Dark => true,
-        Theme::Light => false,
-        Theme::System => matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark),
-    };
+    // AppKit's answer, not gpui's: gpui updates its copy of the appearance a frame later.
+    let dark = mac::set_appearance(match theme {
+        Theme::Dark => Some(true),
+        Theme::Light => Some(false),
+        Theme::System => None,
+    });
     use gpui_kit::component::Theme as Kit;
     Kit::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, Some(window), cx);
     let t = if dark { Tokens::dark() } else { Tokens::light() };
@@ -1052,12 +1084,13 @@ impl Render for Reader {
         let end = canvas(|_, _, _| {}, move |_, _, _, _| draws.borrow_mut().push(t0.elapsed().as_secs_f64() * 1e3));
         let toolbar = self.toolbar(t, window, cx);
         let filters = self.filter_bar(t, window, cx);
-        let side = self.side_pane(t, window, cx);
+        let (right, below) = self.side_panes(t, window, cx);
         let body = match &self.grid {
             Some(_) => {
                 let grid = self.grid_view(t, cx);
-                let area = if self.settings.pane_bottom { div().flex().flex_col() } else { div().flex().flex_row() };
-                area.flex_1().min_h_0().min_w_0().overflow_hidden().child(grid).children(side).into_any_element()
+                // The grid with the Viewer below it in one column; the right panes beside both.
+                let column = div().flex().flex_col().flex_1().min_h_0().min_w_0().overflow_hidden().child(grid).children(below);
+                div().flex().flex_row().flex_1().min_h_0().min_w_0().overflow_hidden().child(column).children(right).into_any_element()
             }
             None => div()
                 .id("empty")
@@ -1100,10 +1133,15 @@ impl Render for Reader {
                     r.settings.split = (split + (f32::from(e.position.y) - at) / r.pane_h.get().max(1.0)).clamp(0.15, 0.85);
                     return cx.notify();
                 }
-                let Some((at, size)) = r.pane_drag else { return };
-                let (now, whole) = if r.settings.pane_bottom { (e.position.y, window.bounds().size.height) } else { (e.position.x, window.bounds().size.width) };
+                let Some((bottom, at, size)) = r.pane_drag else { return };
+                let (now, whole) = if bottom { (e.position.y, window.bounds().size.height) } else { (e.position.x, window.bounds().size.width) };
                 // The pane is right of or below the edge: a drag toward the grid makes it larger.
-                r.settings.pane_size = (size - (f32::from(now) - at)).clamp(160.0, (f32::from(whole) - 240.0).max(160.0));
+                let size = (size - (f32::from(now) - at)).clamp(160.0, (f32::from(whole) - 240.0).max(160.0));
+                if bottom {
+                    r.settings.pane_height = size;
+                } else {
+                    r.settings.pane_size = size;
+                }
                 cx.notify();
             }))
             .on_mouse_up(
@@ -1138,8 +1176,66 @@ impl Render for Reader {
     }
 }
 
+/// `dsv-reader profile FILE [--columns NAME,NAME] [--first N] [--approx]`: the Profile as JSON on
+/// stdout, with no window. Exit 0; 1 for a bad argument or a column that is not in the file; 2
+/// when the file cannot be read.
+fn profile_cli(args: &[String]) -> i32 {
+    const USAGE: &str = "usage: dsv-reader profile FILE [--columns NAME,NAME] [--first N] [--approx]";
+    let (mut file, mut names, mut first, mut distinct) = (None, None, None, dsv::Distinct::Exact);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--columns" => match it.next() {
+                Some(v) => names = Some(v.split(',').map(str::to_string).collect::<Vec<_>>()),
+                None => return usage(USAGE),
+            },
+            "--first" => match it.next().and_then(|n| n.parse::<usize>().ok()) {
+                Some(n) => first = Some(n),
+                None => return usage(USAGE),
+            },
+            "--approx" => distinct = dsv::Distinct::Approx,
+            _ if file.is_none() && !a.starts_with("--") => file = Some(PathBuf::from(a)),
+            _ => return usage(USAGE),
+        }
+    }
+    let Some(file) = file else { return usage(USAGE) };
+    let doc = match Doc::open(&file, &Opts::default(), || {}) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{}: {e}", file.display());
+            return 2;
+        }
+    };
+    while !doc.index.done.load(Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // Every column by number, so two columns with one name both come out.
+    let mut cols: Vec<usize> = if names.is_none() { (0..doc.names.len()).collect() } else { Vec::new() };
+    for n in names.unwrap_or_default() {
+        match doc.names.iter().position(|x| *x == n) {
+            Some(c) => cols.push(c),
+            None => {
+                eprintln!("{}: no column {n:?}", file.display());
+                return 1;
+            }
+        }
+    }
+    println!("{}", dsv::profile_json(&doc, &cols, first, distinct));
+    0
+}
+
+fn usage(text: &str) -> i32 {
+    eprintln!("{text}");
+    1
+}
+
 fn main() {
     START.set(Instant::now()).ok();
+    if std::env::args().nth(1).as_deref() == Some("profile") {
+        let code = profile_cli(&std::env::args().skip(2).collect::<Vec<_>>());
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::process::exit(code);
+    }
     let path = std::env::args_os().nth(1).map(PathBuf::from);
     let scroll = std::env::var_os("DSV_SCROLL").is_some();
     let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);

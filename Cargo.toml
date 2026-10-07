@@ -1,6 +1,6 @@
 [package]
 name = "dsv-reader"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 # The oldest Rust that builds it (checked: 1.95 builds, 1.94 does not; gpui-pre needs it).
 rust-version = "1.95"

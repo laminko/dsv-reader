@@ -105,7 +105,7 @@ pub fn install() {
         if std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/")) {
             return;
         }
-        // ponytail: an NSImage from PNG data; egui issue 7155 saw a stray libpng.dylib crash
+        // Limit: an NSImage from PNG data; egui issue 7155 saw a stray libpng.dylib crash
         // that path. Decode with gpui's image code if a crash shows.
         static PNG: &[u8] = include_bytes!("../icon.png");
         let bytes: unsafe extern "C" fn(Id, Sel, *const c_void, usize) -> Id = send();
@@ -115,6 +115,29 @@ pub fn install() {
         if !image.is_null() {
             set(app, sel(c"setApplicationIconImage:"), image);
         }
+    }
+}
+
+/// The title bar and AppKit's own parts in the app's theme: `Some(dark)`, or `None` to follow
+/// macOS. Without it, the Dark theme on a light Mac keeps a white title bar. Returns whether
+/// the app is now dark.
+pub fn set_appearance(dark: Option<bool>) -> bool {
+    unsafe {
+        let get: unsafe extern "C" fn(Id, Sel) -> Id = send();
+        let call: unsafe extern "C" fn(Id, Sel, Id) -> Id = send();
+        let text: unsafe extern "C" fn(Id, Sel, *const c_char) -> Id = send();
+        let utf8: unsafe extern "C" fn(Id, Sel) -> *const c_char = send();
+        let app = get(class(c"NSApplication"), sel(c"sharedApplication"));
+        let look = dark.map_or(std::ptr::null_mut(), |d| {
+            let name = text(class(c"NSString"), sel(c"stringWithUTF8String:"), if d { c"NSAppearanceNameDarkAqua" } else { c"NSAppearanceNameAqua" }.as_ptr());
+            call(class(c"NSAppearance"), sel(c"appearanceNamed:"), name)
+        });
+        call(app, sel(c"setAppearance:"), look);
+        // The name of the effective appearance: "NSAppearanceNameDarkAqua", or a dark
+        // high-contrast or vibrant one.
+        let name = get(get(app, sel(c"effectiveAppearance")), sel(c"name"));
+        let s = if name.is_null() { std::ptr::null() } else { utf8(name, sel(c"UTF8String")) };
+        !s.is_null() && CStr::from_ptr(s).to_bytes().windows(4).any(|w| w == b"Dark")
     }
 }
 

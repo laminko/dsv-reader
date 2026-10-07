@@ -112,8 +112,11 @@ fn main() -> std::io::Result<()> {
         let all: Vec<u32> = (0..doc.rows() as u32).collect();
         let t = Instant::now();
         let sorted = scan.sort(&all, &[SortKey { col, dir: Dir::Asc }]);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
         let firsts: Vec<String> = sorted.iter().take(3).map(|&r| doc.row(r as usize)[col].clone()).collect();
-        println!("sort {}: {} rows in {:.0} ms · first {firsts:?}", doc.names[col], sorted.len(), t.elapsed().as_secs_f64() * 1e3);
+        // FNV-1a over the order, so two builds can be compared.
+        let hash = sorted.iter().fold(0xcbf29ce484222325u64, |h, &r| r.to_le_bytes().iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3)));
+        println!("sort {}: {} rows in {ms:.0} ms · order hash {hash:016x} · first {firsts:?}", doc.names[col], sorted.len());
     }
     if let Some(i) = args.iter().position(|a| a == "--profile") {
         let distinct = if args.get(i + 1).map(String::as_str) == Some("exact") { Distinct::Exact } else { Distinct::Approx };

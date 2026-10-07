@@ -38,17 +38,21 @@ pub struct Settings {
     /// A font file, or None for the built-in font.
     pub font: Option<PathBuf>,
     pub size: f32,
-    /// The Viewer pane is below the grid, not on its right.
+    /// The Viewer pane is below the grid, not on its right. The Profile is always on the right.
     pub pane_bottom: bool,
+    /// The width of the panes on the right, and the height of the Viewer below the grid.
     pub pane_size: f32,
+    pub pane_height: f32,
     /// The upper pane's share of the side pane when both panes show.
     pub split: f32,
     pub theme: Theme,
+    /// Every second row of the grid on a tint.
+    pub zebra: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { font: None, size: 13.0, pane_bottom: false, pane_size: 360.0, split: 0.5, theme: Theme::System }
+        Settings { font: None, size: 13.0, pane_bottom: false, pane_size: 360.0, pane_height: 280.0, split: 0.5, theme: Theme::System, zebra: true }
     }
 }
 
@@ -57,11 +61,12 @@ impl Settings {
         PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Library/Application Support/dsv-reader/settings.txt")
     }
 
-    /// `font=PATH`, `size=N`, `pane=right|bottom`, `pane_size=N`, `split=0.15–0.85`, and
-    /// `theme=system|light|dark` lines.
+    /// `font=PATH`, `size=N`, `pane=right|bottom`, `pane_size=N`, `pane_height=N`, `split=0.15–0.85`,
+    /// `theme=system|light|dark`, and `zebra=on|off` lines.
     /// A line it cannot read keeps the default.
     pub fn parse(text: &str) -> Settings {
         let mut s = Settings::default();
+        let mut height = false;
         for line in text.lines() {
             match line.split_once('=') {
                 Some(("font", p)) if !p.is_empty() => s.font = Some(PathBuf::from(p)),
@@ -71,6 +76,7 @@ impl Settings {
                     }
                 }
                 Some(("pane", p)) => s.pane_bottom = p.trim() == "bottom",
+                Some(("zebra", z)) => s.zebra = z.trim() != "off",
                 Some(("theme", t)) => {
                     s.theme = match t.trim() {
                         "light" => Theme::Light,
@@ -83,6 +89,12 @@ impl Settings {
                         s.pane_size = n.clamp(120.0, 4000.0);
                     }
                 }
+                Some(("pane_height", n)) => {
+                    height = true;
+                    if let Ok(n) = n.trim().parse::<f32>() {
+                        s.pane_height = n.clamp(120.0, 4000.0);
+                    }
+                }
                 Some(("split", n)) => {
                     if let Ok(n) = n.trim().parse::<f32>().map(|n| n.clamp(0.15, 0.85)) {
                         s.split = n;
@@ -91,6 +103,10 @@ impl Settings {
                 _ => {}
             }
         }
+        // A file older than `pane_height` sized the Viewer below with `pane_size`.
+        if s.pane_bottom && !height {
+            s.pane_height = s.pane_size;
+        }
         s
     }
 
@@ -98,7 +114,8 @@ impl Settings {
         let font = self.font.as_deref().map_or(String::new(), |p| p.display().to_string());
         let pane = if self.pane_bottom { "bottom" } else { "right" };
         let theme = self.theme.name().to_lowercase();
-        format!("font={font}\nsize={}\npane={pane}\npane_size={}\nsplit={}\ntheme={theme}\n", self.size, self.pane_size, self.split)
+        let zebra = if self.zebra { "on" } else { "off" };
+        format!("font={font}\nsize={}\npane={pane}\npane_size={}\npane_height={}\nsplit={}\ntheme={theme}\nzebra={zebra}\n", self.size, self.pane_size, self.pane_height, self.split)
     }
 
     pub fn load() -> Settings {
@@ -260,14 +277,26 @@ mod tests {
 
     #[test]
     fn settings_round_trip_and_bad_lines() {
-        let s = Settings { font: Some("/System/Library/Fonts/Menlo.ttc".into()), size: 15.5, pane_bottom: true, pane_size: 280.0, split: 0.3, theme: Theme::Dark };
+        let s = Settings { font: Some("/System/Library/Fonts/Menlo.ttc".into()), size: 15.5, pane_bottom: true, pane_size: 280.0, pane_height: 333.0, split: 0.3, theme: Theme::Dark, zebra: false };
         assert_eq!(Settings::parse(&s.text()), s);
         assert_eq!(Settings::parse(""), Settings::default());
         assert_eq!(Settings::parse("size=big\nfont=\nx"), Settings::default());
         assert_eq!(Settings::parse("size=99").size, 32.0);
         assert_eq!(Settings::parse("theme=light").theme, Theme::Light);
         assert_eq!(Settings::parse("theme=purple").theme, Theme::System);
+        assert_eq!([Settings::parse("zebra=off").zebra, Settings::parse("zebra=on").zebra, Settings::parse("zebra=x").zebra], [false, true, true]);
         assert_eq!([Settings::parse("split=2").split, Settings::parse("split=0").split, Settings::parse("split=x").split], [0.85, 0.15, 0.5]);
+    }
+
+    #[test]
+    fn pane_height_is_its_own_setting() {
+        // The Viewer below the grid keeps its height; the right panes keep their width.
+        let s = Settings::parse("pane=bottom\npane_size=413\npane_height=250");
+        assert_eq!((s.pane_bottom, s.pane_size, s.pane_height), (true, 413.0, 250.0));
+        assert_eq!(Settings::parse("pane_size=413").pane_height, 280.0, "an older file, the Viewer right: the default height");
+        assert_eq!(Settings::parse("pane=bottom\npane_size=413").pane_height, 413.0, "an older file, the Viewer below: its old size");
+        assert_eq!(Settings::parse("pane=bottom\npane_size=413\npane_height=x").pane_height, 280.0, "a line it cannot read: the default");
+        assert_eq!([Settings::parse("pane_height=1").pane_height, Settings::parse("pane_height=x").pane_height], [120.0, 280.0]);
     }
 
     #[test]
